@@ -41,6 +41,72 @@ async fn token_count_none_resets_context_indicator() {
     assert_eq!(chat.bottom_pane.context_window_percent(), None);
 }
 
+fn token_info_for_turn(output_tokens: i64, reasoning_output_tokens: i64) -> TokenUsageInfo {
+    let last_token_usage = TokenUsage {
+        output_tokens,
+        reasoning_output_tokens,
+        total_tokens: output_tokens + reasoning_output_tokens,
+        ..TokenUsage::default()
+    };
+
+    TokenUsageInfo {
+        total_token_usage: last_token_usage.clone(),
+        last_token_usage,
+        model_context_window: Some(200_000),
+    }
+}
+
+#[tokio::test]
+async fn turn_token_usage_renders_for_each_live_update() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    handle_turn_started(&mut chat, "turn-1");
+    handle_token_count(&mut chat, Some(token_info_for_turn(123, 456)));
+    let first_cells = drain_insert_history(&mut rx);
+    assert_eq!(first_cells.len(), 1);
+    assert_eq!(
+        lines_to_single_string(&first_cells[0]),
+        "• tokens: output 123 · reasoning 456\n"
+    );
+
+    handle_token_count(&mut chat, Some(token_info_for_turn(234, 1_234)));
+    let second_cells = drain_insert_history(&mut rx);
+    assert_eq!(second_cells.len(), 1);
+    assert_eq!(
+        lines_to_single_string(&second_cells[0]),
+        "• tokens: output 234 · reasoning 1,234\n"
+    );
+
+    chat.handle_server_notification(
+        ServerNotification::ThreadTokenUsageUpdated(
+            codex_app_server_protocol::ThreadTokenUsageUpdatedNotification {
+                thread_id: chat.thread_id.as_ref().expect("thread id").to_string(),
+                turn_id: "turn-1".to_string(),
+                token_usage: codex_app_server_protocol::ThreadTokenUsage {
+                    total: codex_app_server_protocol::TokenUsageBreakdown {
+                        total_tokens: 1_515,
+                        input_tokens: 0,
+                        cached_input_tokens: 0,
+                        output_tokens: 999,
+                        reasoning_output_tokens: 516,
+                    },
+                    last: codex_app_server_protocol::TokenUsageBreakdown {
+                        total_tokens: 1_515,
+                        input_tokens: 0,
+                        cached_input_tokens: 0,
+                        output_tokens: 999,
+                        reasoning_output_tokens: 516,
+                    },
+                    model_context_window: Some(200_000),
+                },
+            },
+        ),
+        Some(ReplayKind::ResumeInitialMessages),
+    );
+    assert!(drain_insert_history(&mut rx).is_empty());
+}
+
 #[tokio::test]
 async fn app_server_cyber_policy_error_renders_dedicated_notice() {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;

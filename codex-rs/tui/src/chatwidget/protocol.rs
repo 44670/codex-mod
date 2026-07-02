@@ -30,9 +30,14 @@ impl ChatWidget {
         }
         match notification {
             ServerNotification::ThreadTokenUsageUpdated(notification) => {
-                self.set_token_info(Some(token_usage_info_from_app_server(
-                    notification.token_usage,
-                )));
+                let info = token_usage_info_from_app_server(notification.token_usage);
+                if !from_replay {
+                    self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                        history_cell::new_turn_token_usage(&info.last_token_usage),
+                    )));
+                    self.request_redraw();
+                }
+                self.set_token_info(Some(info));
             }
             ServerNotification::ThreadNameUpdated(notification) => {
                 match ThreadId::from_string(&notification.thread_id) {
