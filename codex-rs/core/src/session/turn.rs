@@ -125,6 +125,8 @@ use tracing::trace;
 use tracing::trace_span;
 use tracing::warn;
 
+const INCOMPLETE_REASONING_FOLLOW_UP_MESSAGE: &str = "Your previous reasoning was incomplete. Think deeply again, and do not send optional commentary.";
+
 /// Takes initial turn input and runs a loop where, at each sampling request,
 /// the model replies with either:
 ///
@@ -299,11 +301,24 @@ pub(crate) async fn run_turn(
                 let SamplingRequestResult {
                     needs_follow_up: model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
+                    incomplete_reasoning_detected,
                 } = sampling_request_output;
                 can_drain_pending_input = true;
-                let (has_pending_input, token_status, estimated_token_count) = async {
-                    let has_pending_input =
-                        sess.input_queue.has_pending_input(&sess.active_turn).await;
+                let has_pending_input = sess.input_queue.has_pending_input(&sess.active_turn).await;
+                let should_send_incomplete_reasoning_follow_up =
+                    incomplete_reasoning_detected && !has_pending_input;
+                if should_send_incomplete_reasoning_follow_up {
+                    sess.record_user_prompt_and_emit_turn_item(
+                        turn_context.as_ref(),
+                        &[UserInput::Text {
+                            text: INCOMPLETE_REASONING_FOLLOW_UP_MESSAGE.to_string(),
+                            text_elements: Vec::new(),
+                        }],
+                        /*client_id*/ None,
+                    )
+                    .await;
+                }
+                let (token_status, estimated_token_count) = async {
                     let token_status = super::context_window::context_window_token_status(
                         sess.as_ref(),
                         turn_context.as_ref(),
@@ -311,11 +326,13 @@ pub(crate) async fn run_turn(
                     .await;
                     let estimated_token_count =
                         sess.get_estimated_token_count(turn_context.as_ref()).await;
-                    (has_pending_input, token_status, estimated_token_count)
+                    (token_status, estimated_token_count)
                 }
                 .instrument(trace_span!("run_turn.collect_post_sampling_state"))
                 .await;
-                let needs_follow_up = model_needs_follow_up || has_pending_input;
+                let needs_follow_up = model_needs_follow_up
+                    || has_pending_input
+                    || should_send_incomplete_reasoning_follow_up;
                 let token_limit_reached = token_status.token_limit_reached;
 
                 trace!(
@@ -330,7 +347,9 @@ pub(crate) async fn run_turn(
                     full_context_window_limit_reached = token_status.full_context_window_limit_reached,
                     token_limit_reached,
                     model_needs_follow_up,
+                    incomplete_reasoning_detected,
                     has_pending_input,
+                    should_send_incomplete_reasoning_follow_up,
                     needs_follow_up,
                     "post sampling token usage"
                 );
@@ -1353,6 +1372,7 @@ pub(crate) async fn built_tools(
 struct SamplingRequestResult {
     needs_follow_up: bool,
     last_agent_message: Option<String>,
+    incomplete_reasoning_detected: bool,
 }
 
 /// Ephemeral per-response state for streaming a single proposed plan.
@@ -2138,6 +2158,7 @@ async fn try_run_sampling_request(
                     break Ok(SamplingRequestResult {
                         needs_follow_up: true,
                         last_agent_message,
+                        incomplete_reasoning_detected: false,
                     });
                 }
             }
@@ -2299,9 +2320,13 @@ async fn try_run_sampling_request(
                 if let Some(false) = end_turn {
                     needs_follow_up = true;
                 }
+                let incomplete_reasoning_detected = token_usage.as_ref().is_some_and(|usage| {
+                    matches!(usage.reasoning_output_tokens, 516 | 1_034 | 1_552)
+                });
                 break Ok(SamplingRequestResult {
                     needs_follow_up,
                     last_agent_message,
+                    incomplete_reasoning_detected,
                 });
             }
             ResponseEvent::OutputTextDelta(delta) => {

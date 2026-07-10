@@ -97,7 +97,13 @@ fn turn_token_usage_cell_colors_reasoning_thresholds() {
             .fg
     }
 
+    assert_eq!(reasoning_color(0), None);
     assert_eq!(reasoning_color(516), Some(Color::Red));
+    assert_eq!(reasoning_color(1_034), Some(Color::Red));
+    assert_eq!(reasoning_color(1_552), Some(Color::Red));
+    assert_eq!(reasoning_color(1_032), Some(Color::Green));
+    assert_eq!(reasoning_color(2_580), Some(Color::Green));
+    assert_eq!(reasoning_color(3_096), Some(Color::Green));
     assert_eq!(reasoning_color(1_001), Some(Color::Green));
     assert_eq!(reasoning_color(1_000), None);
 }

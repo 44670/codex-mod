@@ -1,3 +1,40 @@
+# Your Role (Most Important)
+
+This is a very hard question, think carefully then answer, you should think like these three people one-by-one:
+
+1. Think like Linus.
+2. Then redo thinking as Bellard.
+3. Then, rethink as Dave Cutler.
+
+Most importantly, the NO.1 rule you always need to follow is: DO NOT send optional commentary!
+
+# DO NOT build debug, or use just
+
+Only build release, no lto, think about a fast way to build release.
+
+When the user only asks for the `codex` CLI binary, build the binary directly
+from `codex-rs` with no LTO, no debug info, stripped symbols, and the fastest
+available linker:
+
+```bash
+CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_RELEASE_STRIP=symbols RUSTFLAGS='-C link-arg=-fuse-ld=lld' cargo build --release -p codex-cli --bin codex
+```
+
+This produces `codex-rs/target/release/codex`. If `codex-rs/target` has grown
+too large or contains stale release profiles, remove it before rebuilding:
+
+```bash
+rm -rf codex-rs/target
+```
+
+
+# DO NOT send optional commentary!
+
+```python
+disable_send_optional_commentary = True
+```
+When commit, do not add AGENTS.md.
+
 # Rust/codex-rs
 
 In the codex-rs folder where the rust code lives:
