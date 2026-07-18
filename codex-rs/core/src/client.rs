@@ -69,6 +69,7 @@ use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::RefreshTokenError;
 use codex_login::UnauthorizedRecovery;
+use codex_login::default_client::add_originator_header;
 use codex_login::default_client::build_default_reqwest_client_for_route;
 use codex_otel::SessionTelemetry;
 use codex_otel::current_span_w3c_trace_context;
@@ -466,10 +467,10 @@ impl ModelClient {
         self
     }
 
-    fn prompt_cache_key(&self) -> String {
+    fn prompt_cache_key(&self, responses_metadata: &CodexResponsesMetadata) -> String {
         self.prompt_cache_key_override
             .clone()
-            .unwrap_or_else(|| self.state.thread_id.to_string())
+            .unwrap_or_else(|| responses_metadata.session_id.clone())
     }
 
     /// Creates a fresh turn-scoped streaming session.
@@ -809,11 +810,9 @@ impl ModelClient {
             effort: effort
                 .or_else(|| model_info.default_reasoning_level.clone())
                 .map(reasoning_effort_for_request),
-            summary: if summary == ReasoningSummaryConfig::None {
-                None
-            } else {
-                Some(summary)
-            },
+            summary: (model_info.supports_reasoning_summary_parameter
+                && summary != ReasoningSummaryConfig::None)
+                .then_some(summary),
             // When Responses Lite is disabled, omit context so Responses uses the default,
             // which is currently `current_turn`.
             context: model_info
@@ -863,11 +862,13 @@ impl ModelClient {
         } else {
             (prompt.base_instructions.text.clone(), Some(tools))
         };
-        let stream_options = (self.state.concurrent_reasoning_summaries_enabled && is_openai)
-            .then_some(StreamOptions {
-                reasoning_summary_delivery: codex_api::ReasoningSummaryDelivery::SequentialCutoff,
-            });
-        let reasoning = Some(Self::build_reasoning(model_info, effort, summary));
+        let reasoning = Self::build_reasoning(model_info, effort, summary);
+        let stream_options = (self.state.concurrent_reasoning_summaries_enabled
+            && is_openai
+            && reasoning.summary.is_some())
+        .then_some(StreamOptions {
+            reasoning_summary_delivery: codex_api::ReasoningSummaryDelivery::SequentialCutoff,
+        });
         let include = vec!["reasoning.encrypted_content".to_string()];
         let verbosity = if model_info.support_verbosity {
             self.state.model_verbosity.or(model_info.default_verbosity)
@@ -885,7 +886,7 @@ impl ModelClient {
             &prompt.output_schema,
             prompt.output_schema_strict,
         );
-        let prompt_cache_key = Some(self.prompt_cache_key());
+        let prompt_cache_key = Some(self.prompt_cache_key(responses_metadata));
         let service_tier = model_info.service_tier_for_request(service_tier);
         let request = ResponsesApiRequest {
             model: model_info.slug.clone(),
@@ -894,7 +895,7 @@ impl ModelClient {
             tools,
             tool_choice: "auto".to_string(),
             parallel_tool_calls: prompt.parallel_tool_calls && !model_info.use_responses_lite,
-            reasoning,
+            reasoning: Some(reasoning),
             store: provider.is_azure_responses_endpoint(),
             stream: true,
             stream_options,
@@ -908,6 +909,12 @@ impl ModelClient {
     }
 
     fn prepare_response_items_for_request(&self, input: &mut [ResponseItem], store: bool) {
+        for item in input.iter_mut() {
+            if item.id().is_some_and(|id| !id.is_prefixed()) {
+                item.set_id(/*new_id*/ None);
+            }
+        }
+
         if self.state.item_ids_enabled || store {
             return;
         }
@@ -1878,22 +1885,6 @@ fn build_responses_headers(
     headers
 }
 
-pub(crate) fn add_originator_header(headers: &mut ApiHeaderMap, originator: &str) {
-    let default_originator = codex_login::default_client::originator();
-    if originator == default_originator.value.as_str() {
-        return;
-    }
-
-    match HeaderValue::from_str(originator) {
-        Ok(header_value) => {
-            headers.insert("originator", header_value);
-        }
-        Err(err) => {
-            warn!("ignoring invalid thread originator header value: {err}");
-        }
-    }
-}
-
 fn add_responses_lite_header(headers: &mut ApiHeaderMap, use_responses_lite: bool) {
     if use_responses_lite {
         headers.insert(
@@ -1996,14 +1987,7 @@ where
                 }) => {
                     feedback_tags!(last_model_response_id = &response_id);
                     if let Some(usage) = &token_usage {
-                        session_telemetry.sse_event_completed(
-                            usage.input_tokens,
-                            usage.output_tokens,
-                            Some(usage.cached_input_tokens),
-                            Some(usage.reasoning_output_tokens),
-                            usage.total_tokens,
-                            ttft_ms,
-                        );
+                        session_telemetry.sse_event_completed(usage, ttft_ms);
                     }
                     inference_trace_attempt.record_completed(
                         &response_id,
