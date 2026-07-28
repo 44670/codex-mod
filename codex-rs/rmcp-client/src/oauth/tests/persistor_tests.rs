@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::Context;
 use anyhow::Result;
 use codex_config::types::AuthKeyringBackendKind;
+use codex_config::types::OAuthCredentialsStoreMode;
 use keyring::Error as KeyringError;
 use oauth2::AccessToken;
 use oauth2::TokenResponse;
@@ -39,6 +40,7 @@ use crate::oauth::compute_store_key;
 use crate::oauth::load_oauth_tokens_from_file;
 use crate::oauth::refresh_lock::RefreshCredentialLock;
 use crate::oauth::save_oauth_tokens_to_file;
+use crate::oauth::stored_oauth_credentials;
 use crate::startup_error::is_authentication_required_error;
 
 const REFRESH_LOCK_CONTENTION_EVENT_TARGET: &str =
@@ -114,6 +116,7 @@ async fn concurrent_refreshes_call_provider_once_and_carry_omitted_fields() -> R
 
     let first = persistor_for(&initial).await?;
     let second = persistor_for(&initial).await?;
+    let initial_credentials = first.stored_credentials().await;
     let first_task = tokio::spawn({
         let first = first.clone();
         async move { first.refresh_if_needed().await }
@@ -135,6 +138,15 @@ async fn concurrent_refreshes_call_provider_once_and_carry_omitted_fields() -> R
     first.persist_if_needed().await?;
     let stored = load_oauth_tokens_from_file(&initial.server_name, &initial.url)?
         .expect("refreshed credentials should be stored");
+    let live_credentials = first.stored_credentials().await;
+    let disk_credentials = stored_oauth_credentials(
+        &initial.server_name,
+        &initial.url,
+        OAuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::Direct,
+    )?;
+    assert_eq!(live_credentials, disk_credentials);
+    assert_ne!(live_credentials, initial_credentials);
     let mut expected_response = initial.token_response.0.clone();
     expected_response.set_access_token(AccessToken::new("refreshed-access-token".to_string()));
     // File loads derive `expires_in` from stable `expires_at`, so it may tick down before this
@@ -226,6 +238,39 @@ async fn rejected_refresh_token_requires_reauthorization() -> Result<()> {
     assert!(is_authentication_required_error(&error));
     let stored = load_oauth_tokens_from_file(&initial.server_name, &initial.url)?
         .expect("rejected refresh must preserve the durable credentials");
+    assert_tokens_match_without_expiry(&stored, &initial);
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn transient_refresh_failure_does_not_require_reauthorization() -> Result<()> {
+    let (_env, server, initial) = test_context().await?;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .and(body_string_contains("refresh_token=refresh-token"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+            "error": "temporarily_unavailable",
+            "error_description": "provider is temporarily unavailable",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    save_oauth_tokens_to_file(&initial)?;
+    let persistor = persistor_for(&initial).await?;
+
+    let error = persistor
+        .refresh_if_needed()
+        .await
+        .expect_err("a transient provider failure should not erase valid credentials");
+    assert!(!is_authentication_required_error(&error));
+    assert!(error.chain().any(|source| matches!(
+        source.downcast_ref::<AuthError>(),
+        Some(AuthError::TokenRefreshFailed(_))
+    )));
+    let stored = load_oauth_tokens_from_file(&initial.server_name, &initial.url)?
+        .expect("a transient refresh failure must preserve durable credentials");
     assert_tokens_match_without_expiry(&stored, &initial);
     server.verify().await;
     Ok(())
@@ -370,6 +415,7 @@ async fn mount_oauth_metadata(server: &MockServer) {
     Mock::given(method("GET"))
         .and(path("/.well-known/oauth-authorization-server/mcp"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "issuer": format!("{}/mcp", server.uri()),
             "authorization_endpoint": format!("{}/oauth/authorize", server.uri()),
             "token_endpoint": format!("{}/oauth/token", server.uri()),
             "scopes_supported": ["scope-a", "scope-b"],

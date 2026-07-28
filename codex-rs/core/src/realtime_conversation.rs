@@ -24,6 +24,7 @@ use codex_api::RealtimeSessionMode;
 use codex_api::RealtimeWebsocketClient;
 use codex_api::RealtimeWebsocketEvents;
 use codex_api::RealtimeWebsocketWriter;
+use codex_api::build_session_headers;
 use codex_api::map_api_error;
 use codex_config::config_toml::RealtimeWsMode;
 use codex_config::config_toml::RealtimeWsVersion;
@@ -57,11 +58,13 @@ use codex_protocol::protocol::RealtimeTranscriptEntry;
 use codex_protocol::protocol::RealtimeVoice;
 use codex_protocol::protocol::RealtimeVoicesList;
 use codex_utils_output_truncation::approx_bytes_for_tokens;
+use codex_utils_string::approx_token_count;
 use codex_utils_string::take_bytes_at_char_boundary;
 use http::HeaderMap;
 use http::HeaderValue;
 use http::header::AUTHORIZATION;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -87,6 +90,8 @@ const HANDOFF_OUT_QUEUE_CAPACITY: usize = 64;
 const OUTPUT_EVENTS_QUEUE_CAPACITY: usize = 256;
 const REALTIME_STARTUP_CONTEXT_TOKEN_BUDGET: usize = 5_300;
 const REALTIME_ASSISTANT_OUTPUT_TOKEN_BUDGET: usize = 1_000;
+const REALTIME_INITIAL_ITEMS_MAX_COUNT: usize = 128;
+const REALTIME_INITIAL_ITEMS_MAX_TOKENS: usize = 8_192;
 const HANDOFF_STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(200);
 const HANDOFF_STREAM_TRUNCATION_MARKER: &str = "\n…output truncated…\n";
 const AGENT_FINAL_MESSAGE_PREFIX: &str = "\"Agent Final Message\":\n\n";
@@ -134,6 +139,7 @@ struct RealtimeHandoffState {
     codex_responses_as_items: bool,
     codex_response_item_prefix: Option<String>,
     codex_response_handoff_mode: CodexResponseHandoffMode,
+    codex_response_handoff_channel_prefixes: Arc<BTreeMap<String, Vec<String>>>,
     session_kind: RealtimeSessionKind,
     event_parser: RealtimeEventParser,
 }
@@ -426,28 +432,6 @@ struct RealtimeInputChannels {
 }
 
 impl RealtimeHandoffState {
-    fn new(
-        output_tx: Sender<RealtimeOutbound>,
-        client_managed_handoffs: bool,
-        codex_responses_as_items: bool,
-        codex_response_item_prefix: Option<String>,
-        codex_response_handoff_mode: CodexResponseHandoffMode,
-        session_kind: RealtimeSessionKind,
-        event_parser: RealtimeEventParser,
-    ) -> Self {
-        Self {
-            output_tx,
-            last_output: Arc::new(Mutex::new(None)),
-            stream: Arc::new(Mutex::new(RealtimeHandoffStreamState::default())),
-            client_managed_handoffs,
-            codex_responses_as_items,
-            codex_response_item_prefix,
-            codex_response_handoff_mode,
-            session_kind,
-            event_parser,
-        }
-    }
-
     fn streams_handoff_append(&self) -> bool {
         self.event_parser == RealtimeEventParser::FramelessBidi
             && !self.client_managed_handoffs
@@ -480,6 +464,7 @@ struct RealtimeStart {
     codex_responses_as_items: bool,
     codex_response_item_prefix: Option<String>,
     codex_response_handoff_mode: CodexResponseHandoffMode,
+    codex_response_handoff_channel_prefixes: Option<BTreeMap<String, Vec<String>>>,
     realtime_call_api_provider: Option<ApiProvider>,
     session_config: RealtimeSessionConfig,
     model_client: ModelClient,
@@ -539,6 +524,7 @@ impl RealtimeConversationManager {
             codex_responses_as_items,
             codex_response_item_prefix,
             codex_response_handoff_mode,
+            codex_response_handoff_channel_prefixes,
             realtime_call_api_provider,
             session_config,
             model_client,
@@ -562,15 +548,20 @@ impl RealtimeConversationManager {
 
         let realtime_active = Arc::new(AtomicBool::new(true));
         let stop_token = CancellationToken::new();
-        let handoff = RealtimeHandoffState::new(
-            handoff_output_tx,
+        let handoff = RealtimeHandoffState {
+            output_tx: handoff_output_tx,
+            last_output: Arc::new(Mutex::new(None)),
+            stream: Arc::new(Mutex::new(RealtimeHandoffStreamState::default())),
             client_managed_handoffs,
             codex_responses_as_items,
             codex_response_item_prefix,
             codex_response_handoff_mode,
+            codex_response_handoff_channel_prefixes: Arc::new(
+                codex_response_handoff_channel_prefixes.unwrap_or_default(),
+            ),
             session_kind,
             event_parser,
-        );
+        };
         let input_channels = RealtimeInputChannels {
             text_rx,
             handoff_output_rx,
@@ -751,7 +742,10 @@ impl RealtimeConversationManager {
             return Ok(());
         }
         let phase = if handoff.routes_handoff_by_bem() {
-            match bem_message_phase(&output_text) {
+            match bem_message_phase(
+                &output_text,
+                &handoff.codex_response_handoff_channel_prefixes,
+            ) {
                 Some(phase) => Some(phase),
                 None => {
                     warn!("BEM output did not contain a recognized channel header");
@@ -851,9 +845,11 @@ impl RealtimeConversationManager {
                 } else {
                     phase
                 },
-                bem_channel_parser: handoff
-                    .routes_handoff_by_bem()
-                    .then(BemChannelParser::default),
+                bem_channel_parser: handoff.routes_handoff_by_bem().then(|| {
+                    BemChannelParser::new(Arc::clone(
+                        &handoff.codex_response_handoff_channel_prefixes,
+                    ))
+                }),
                 prefix_final_message: handoff.event_parser == RealtimeEventParser::V1,
                 sent_bytes: 0,
                 buffered_text: String::new(),
@@ -1100,6 +1096,7 @@ struct PreparedRealtimeConversationStart {
     codex_responses_as_items: bool,
     codex_response_item_prefix: Option<String>,
     codex_response_handoff_mode: CodexResponseHandoffMode,
+    codex_response_handoff_channel_prefixes: Option<BTreeMap<String, Vec<String>>>,
     realtime_call_api_provider: Option<ApiProvider>,
     requested_realtime_session_id: Option<String>,
     version: RealtimeWsVersion,
@@ -1159,7 +1156,7 @@ async fn prepare_realtime_start(
     let requested_realtime_session_id = session_config.session_id.clone();
     let event_parser = session_config.event_parser;
     let originator = sess.originator().await;
-    let extra_headers = match transport {
+    let mut extra_headers = match transport {
         ConversationStartTransport::Websocket => {
             let realtime_api_key = realtime_api_key(auth.as_ref(), &provider)?;
             realtime_request_headers(
@@ -1177,15 +1174,21 @@ async fn prepare_realtime_start(
                 originator.as_str(),
             )?
         }
-    };
+    }
+    .unwrap_or_default();
+    extra_headers.extend(build_session_headers(
+        Some(sess.session_id().to_string()),
+        Some(sess.thread_id().to_string()),
+    ));
     Ok(PreparedRealtimeConversationStart {
         api_provider,
-        extra_headers,
+        extra_headers: Some(extra_headers),
         client_managed_handoffs: params.client_managed_handoffs,
         flush_transcript_tail_on_session_end: params.flush_transcript_tail_on_session_end,
         codex_responses_as_items: params.codex_responses_as_items,
         codex_response_item_prefix: params.codex_response_item_prefix,
         codex_response_handoff_mode: params.codex_response_handoff_mode,
+        codex_response_handoff_channel_prefixes: params.codex_response_handoff_channel_prefixes,
         realtime_call_api_provider,
         requested_realtime_session_id,
         version,
@@ -1240,6 +1243,31 @@ pub(crate) async fn build_realtime_session_config(
         (false, true) => prompt,
         (false, false) => format!("{prompt}\n\n{startup_context}"),
     };
+    if version != RealtimeWsVersion::V3 && !params.initial_items.is_empty() {
+        return Err(CodexErr::InvalidRequest(
+            "initial realtime items require realtime v3".to_string(),
+        ));
+    }
+    if params.initial_items.len() > REALTIME_INITIAL_ITEMS_MAX_COUNT {
+        return Err(CodexErr::InvalidRequest(format!(
+            "initial realtime items must contain no more than {REALTIME_INITIAL_ITEMS_MAX_COUNT} items"
+        )));
+    }
+    let mut total_initial_item_tokens: usize = 0;
+    for item in &params.initial_items {
+        let item_tokens = approx_token_count(&item.text);
+        if item_tokens > REALTIME_INITIAL_ITEMS_MAX_TOKENS {
+            return Err(CodexErr::InvalidRequest(format!(
+                "each initial realtime item must not exceed {REALTIME_INITIAL_ITEMS_MAX_TOKENS} estimated tokens"
+            )));
+        }
+        total_initial_item_tokens = total_initial_item_tokens.saturating_add(item_tokens);
+    }
+    if total_initial_item_tokens > REALTIME_INITIAL_ITEMS_MAX_TOKENS {
+        return Err(CodexErr::InvalidRequest(format!(
+            "initial realtime items must not exceed {REALTIME_INITIAL_ITEMS_MAX_TOKENS} estimated tokens in total"
+        )));
+    }
     let model = Some(
         params
             .model
@@ -1277,6 +1305,7 @@ pub(crate) async fn build_realtime_session_config(
     validate_realtime_voice(version, voice)?;
     Ok(RealtimeSessionConfig {
         instructions: prompt,
+        initial_items: params.initial_items.clone(),
         model,
         session_id: Some(
             params
@@ -1358,6 +1387,7 @@ async fn handle_start_inner(
         codex_responses_as_items,
         codex_response_item_prefix,
         codex_response_handoff_mode,
+        codex_response_handoff_channel_prefixes,
         realtime_call_api_provider,
         requested_realtime_session_id,
         version,
@@ -1377,6 +1407,7 @@ async fn handle_start_inner(
         codex_responses_as_items,
         codex_response_item_prefix,
         codex_response_handoff_mode,
+        codex_response_handoff_channel_prefixes,
         realtime_call_api_provider,
         session_config,
         model_client: sess.services.model_client.clone(),

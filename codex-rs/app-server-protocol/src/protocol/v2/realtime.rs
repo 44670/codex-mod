@@ -9,6 +9,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
+use std::collections::BTreeMap;
 use ts_rs::TS;
 
 /// EXPERIMENTAL - thread realtime audio chunk.
@@ -87,6 +88,10 @@ pub struct ThreadRealtimeStartParams {
     /// default to `thinking`. Realtime V1 and V2 ignore this setting.
     #[ts(optional = nullable)]
     pub codex_response_handoff_mode: Option<CodexResponseHandoffMode>,
+    /// Overrides BEM channel prefixes by `analysis`, `commentary`, or `final`.
+    /// Omitted channels retain their default uppercase bracketed prefixes.
+    #[ts(optional = nullable)]
+    pub codex_response_handoff_channel_prefixes: Option<BTreeMap<String, Vec<String>>>,
     /// Overrides the configured realtime model for this session only.
     #[ts(optional = nullable)]
     pub model: Option<String>,
@@ -96,6 +101,11 @@ pub struct ThreadRealtimeStartParams {
     /// Set to false to start without Codex's startup context. Omitted or null includes it.
     #[ts(optional = nullable)]
     pub include_startup_context: Option<bool>,
+    /// Adds complete role-bearing text items to the initial Frameless Bidi session history.
+    /// This is only supported by realtime V3 and is sent during session startup. Requests are
+    /// limited to 128 items and 8,192 estimated text tokens in total.
+    #[ts(optional = nullable)]
+    pub initial_items: Option<Vec<ThreadRealtimeInitialItem>>,
     #[serde(
         default,
         deserialize_with = "crate::protocol::serde_helpers::deserialize_double_option",
@@ -113,6 +123,15 @@ pub struct ThreadRealtimeStartParams {
     pub version: Option<RealtimeConversationVersion>,
     #[ts(optional = nullable)]
     pub voice: Option<RealtimeVoice>,
+}
+
+/// EXPERIMENTAL - role-bearing text item included when a realtime V3 session starts.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadRealtimeInitialItem {
+    pub role: ConversationTextRole,
+    pub text: String,
 }
 
 /// EXPERIMENTAL - transport used by thread realtime.

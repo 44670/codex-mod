@@ -548,7 +548,8 @@ fn create_collab_input_items_schema() -> JsonSchema {
         (
             "type".to_string(),
             JsonSchema::string(Some(
-                "Input item type: text, image, local_image, skill, or mention.".to_string(),
+                "Input item type: text, image, local_image, audio, local_audio, skill, or mention."
+                    .to_string(),
             )),
         ),
         (
@@ -561,7 +562,7 @@ fn create_collab_input_items_schema() -> JsonSchema {
         ),
         (
             "audio_url".to_string(),
-            JsonSchema::string(Some("Audio URL when type is audio.".to_string())),
+            JsonSchema::string(Some("Audio data URL when type is audio.".to_string())),
         ),
         (
             "path".to_string(),
@@ -876,7 +877,7 @@ fn wait_agent_tool_parameters_v2(options: WaitAgentTimeoutOptions) -> JsonSchema
     let properties = BTreeMap::from([(
         "timeout_ms".to_string(),
         JsonSchema::number(Some(format!(
-            "Timeout in milliseconds. Defaults to {}, min {}, max {}.",
+            "Timeout in milliseconds. Defaults to {}, min {}, max {}. Prefer longer waits (minutes) to avoid busy polling.",
             options.default_timeout_ms, options.min_timeout_ms, options.max_timeout_ms,
         ))),
     )]);

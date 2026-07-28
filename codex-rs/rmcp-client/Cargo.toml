@@ -18,6 +18,7 @@ base64 = { workspace = true }
 codex-api = { workspace = true }
 codex-config = { workspace = true }
 codex-exec-server = { workspace = true }
+codex-http-client = { workspace = true }
 codex-keyring-store = { workspace = true }
 codex-protocol = { workspace = true }
 codex-secrets = { workspace = true }
@@ -49,7 +50,7 @@ rmcp = { workspace = true, default-features = false, features = [
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-sse-stream = "0.2.1"
+sse-stream = "0.2.5"
 thiserror = { workspace = true }
 tiny_http = { workspace = true }
 tokio = { workspace = true, features = [
