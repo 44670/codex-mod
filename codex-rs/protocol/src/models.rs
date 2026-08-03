@@ -34,6 +34,8 @@ pub use executed_tool_calls::ExecutedToolCall;
 pub use executed_tool_calls::ExecutedToolCallArguments;
 pub use executed_tool_calls::ExecutedToolCallTruncation;
 pub use executed_tool_calls::bound_executed_tool_calls_for_prompt;
+pub use executed_tool_calls::bound_executed_tool_calls_for_prompt_prioritizing_recent;
+pub use executed_tool_calls::executed_tool_call_metadata_bytes;
 
 /// Controls the per-command sandbox override requested by a shell-like tool call.
 #[derive(
@@ -882,6 +884,9 @@ pub enum ResponseItem {
         // JSON, not as an already‑parsed object. We keep it as a raw string here and let
         // Session::handle_function_call parse it into a Value.
         arguments: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        encrypted_function_args: Option<Vec<String>>,
         call_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
@@ -2892,10 +2897,27 @@ mod tests {
                 name: "mcp__codex_apps__gmail_get_recent_emails".to_string(),
                 namespace: Some("mcp__codex_apps__gmail".to_string()),
                 arguments: "{\"top_k\":5}".to_string(),
+                encrypted_function_args: None,
                 call_id: "call-1".to_string(),
                 internal_chat_message_metadata_passthrough: None,
             }
         );
+    }
+
+    #[test]
+    fn function_call_preserves_empty_encrypted_function_args() {
+        let value = serde_json::json!({
+            "type": "function_call",
+            "name": "spawn_agent",
+            "namespace": "collaboration",
+            "arguments": "{\"message\":\"hello\",\"task_name\":\"worker\"}",
+            "encrypted_function_args": [],
+            "call_id": "call-1",
+        });
+        let item: ResponseItem =
+            serde_json::from_value(value.clone()).expect("function_call should deserialize");
+
+        assert_eq!(serde_json::to_value(item).expect("serialize item"), value);
     }
 
     #[test]

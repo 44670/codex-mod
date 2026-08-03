@@ -176,6 +176,13 @@ pub(crate) enum KeymapEditIntent {
     ReplaceOne { old_key: String },
 }
 
+/// Number of key strokes recorded by one `/keymap` capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeymapCaptureMode {
+    SingleKey,
+    Chord,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum AppEvent {
@@ -287,8 +294,10 @@ pub(crate) enum AppEvent {
     /// Permanently delete the current active main thread and exit after it succeeds.
     DeleteCurrentThread,
 
-    /// Fork the current session into a new thread.
-    ForkCurrentSession,
+    /// Fork the current session into a new thread, optionally assigning it a name.
+    ForkCurrentSession {
+        name: Option<String>,
+    },
 
     /// Branch before a selected prompt and reopen it in the new thread's composer.
     ForkSessionForPromptEdit {
@@ -1114,6 +1123,7 @@ pub(crate) enum AppEvent {
         context: String,
         action: String,
         intent: KeymapEditIntent,
+        capture_mode: KeymapCaptureMode,
     },
 
     /// Open the keymap keypress inspector.
