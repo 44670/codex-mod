@@ -1013,6 +1013,7 @@ fn blocking_replace_mcp_servers_round_trips() {
             enabled: true,
             required: false,
             supports_parallel_tool_calls: true,
+            omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
             tool_timeout_sec: None,
@@ -1039,11 +1040,13 @@ fn blocking_replace_mcp_servers_round_trips() {
                         .collect(),
                 ),
                 env_http_headers: None,
+                http_headers_helper: Some("auth-cli headers".to_string()),
             },
             environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: false,
             required: false,
             supports_parallel_tool_calls: false,
+            omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: Some(std::time::Duration::from_secs(5)),
             tool_timeout_sec: None,
@@ -1070,6 +1073,7 @@ fn blocking_replace_mcp_servers_round_trips() {
 [mcp_servers.http]
 url = \"https://example.com\"
 bearer_token_env_var = \"TOKEN\"
+http_headers_helper = \"auth-cli headers\"
 enabled = false
 startup_timeout_sec = 5.0
 disabled_tools = [\"forbidden\"]
@@ -1116,6 +1120,7 @@ fn blocking_replace_mcp_servers_serializes_tool_approval_overrides() {
             enabled: true,
             required: false,
             supports_parallel_tool_calls: false,
+            omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
             tool_timeout_sec: None,
@@ -1177,6 +1182,7 @@ foo = { command = "cmd" }
             enabled: true,
             required: false,
             supports_parallel_tool_calls: false,
+            omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
             tool_timeout_sec: None,
@@ -1228,6 +1234,7 @@ foo = { command = "cmd" } # keep me
             enabled: false,
             required: false,
             supports_parallel_tool_calls: false,
+            omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
             tool_timeout_sec: None,
@@ -1278,6 +1285,7 @@ foo = { command = "cmd", args = ["--flag"] } # keep me
             enabled: true,
             required: false,
             supports_parallel_tool_calls: false,
+            omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
             tool_timeout_sec: None,
@@ -1329,6 +1337,7 @@ foo = { command = "cmd" }
             enabled: false,
             required: false,
             supports_parallel_tool_calls: false,
+            omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
             tool_timeout_sec: None,

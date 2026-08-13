@@ -9,6 +9,8 @@ use crate::facts::AnalyticsJsonRpcError;
 use crate::facts::AppInvocation;
 use crate::facts::AppMentionedInput;
 use crate::facts::AppUsedInput;
+use crate::facts::ArtifactOperation;
+use crate::facts::ArtifactOperationInput;
 use crate::facts::CodexGoalEvent;
 use crate::facts::CustomAnalyticsFact;
 use crate::facts::ExternalAgentConfigImportCompletedInput;
@@ -20,6 +22,7 @@ use crate::facts::PluginInstallFailedInput;
 use crate::facts::PluginInstallRequested;
 use crate::facts::PluginInstallRequestedInput;
 use crate::facts::PluginInstallSource;
+use crate::facts::PluginMeasurementsInput;
 use crate::facts::PluginState;
 use crate::facts::PluginStateChangedInput;
 use crate::facts::SkillInvocation;
@@ -32,6 +35,9 @@ use crate::facts::TurnResolvedConfigFact;
 use crate::facts::TurnTokenUsageFact;
 use crate::now_unix_millis;
 use crate::reducer::AnalyticsReducer;
+use crate::reducer::MAX_PLUGIN_MEASUREMENTS_PER_BATCH;
+use crate::reducer::valid_plugin_measurement_identifier;
+use crate::reducer::valid_plugin_measurement_row;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ClientResponsePayload;
 use codex_app_server_protocol::InitializeParams;
@@ -141,6 +147,9 @@ impl AnalyticsEventsQueue {
                 let input = match input {
                     AnalyticsEventsQueueMessage::Fact(input) => *input,
                     AnalyticsEventsQueueMessage::Flush(done_tx) => {
+                        let mut events = Vec::new();
+                        reducer.flush(&mut events);
+                        send_track_events(&auth_manager, &destination, events).await;
                         let _ = done_tx.send(());
                         continue;
                     }
@@ -250,6 +259,26 @@ impl AnalyticsEventsClient {
         }
     }
 
+    pub fn is_enabled(&self) -> bool {
+        self.queue.is_some()
+    }
+
+    pub fn track_plugin_measurements(&self, mut input: PluginMeasurementsInput) {
+        if input.rows.is_empty()
+            || input.rows.len() > MAX_PLUGIN_MEASUREMENTS_PER_BATCH
+            || !valid_plugin_measurement_identifier(&input.operation)
+        {
+            return;
+        }
+        input.rows.retain(valid_plugin_measurement_row);
+        if input.rows.is_empty() {
+            return;
+        }
+        self.record_fact(AnalyticsFact::Custom(
+            CustomAnalyticsFact::PluginMeasurements(input),
+        ));
+    }
+
     pub fn track_skill_invocations(
         &self,
         tracking: TrackEventsContext,
@@ -264,6 +293,19 @@ impl AnalyticsEventsClient {
                 invocations,
             },
         )));
+    }
+
+    pub fn track_artifact_operation(
+        &self,
+        tracking: TrackEventsContext,
+        operation: ArtifactOperation,
+    ) {
+        self.record_fact(AnalyticsFact::Custom(
+            CustomAnalyticsFact::ArtifactOperation(ArtifactOperationInput {
+                tracking,
+                operation,
+            }),
+        ));
     }
 
     pub fn track_initialize(
@@ -285,6 +327,12 @@ impl AnalyticsEventsClient {
     pub fn track_subagent_thread_started(&self, input: SubAgentThreadStartedInput) {
         self.record_fact(AnalyticsFact::Custom(
             CustomAnalyticsFact::SubAgentThreadStarted(input),
+        ));
+    }
+
+    pub fn track_code_mode_tool_call(&self, input: crate::facts::CodeModeToolCallFact) {
+        self.record_fact(AnalyticsFact::Custom(
+            CustomAnalyticsFact::CodeModeToolCall(input),
         ));
     }
 
@@ -607,7 +655,10 @@ impl AnalyticsEventsClient {
     pub fn track_notification(&self, notification: &ServerNotification) {
         if !matches!(
             notification,
-            ServerNotification::TurnStarted(_)
+            ServerNotification::ThreadArchived(_)
+                | ServerNotification::ThreadClosed(_)
+                | ServerNotification::ThreadUnarchived(_)
+                | ServerNotification::TurnStarted(_)
                 | ServerNotification::TurnCompleted(_)
                 | ServerNotification::TurnDiffUpdated(_)
                 | ServerNotification::ItemStarted(_)

@@ -10,7 +10,6 @@ use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::ExecCommandToolOutput;
 use crate::unified_exec::WriteStdinRequest;
-use crate::unified_exec::process::OutputHandles;
 use codex_exec_server::ExecProcess;
 use codex_exec_server::ExecProcessEventReceiver;
 use codex_exec_server::ExecProcessFuture;
@@ -125,13 +124,17 @@ async fn exec_command_with_tty(
             )
             .await?,
     );
-    let context =
-        UnifiedExecContext::new(Arc::clone(session), Arc::clone(turn), "call".to_string());
+    let context = UnifiedExecContext::new(
+        Arc::clone(session),
+        crate::session::step_context::StepContext::for_test(Arc::clone(turn)),
+        "call".to_string(),
+    );
     let started_at = Instant::now();
     let process_started_alive = !process.has_exited() && process.exit_code().is_none();
     if process_started_alive {
         let entry = ProcessEntry {
             process: Arc::clone(&process),
+            plugin_metrics_sidecar: None,
             call_id: context.call_id.clone(),
             process_id,
             cwd: cwd.clone().into(),
@@ -150,20 +153,9 @@ async fn exec_command_with_tty(
             .insert(process_id, entry);
     }
 
-    let OutputHandles {
-        output_buffer,
-        output_notify,
-        output_closed,
-        output_closed_notify,
-        cancellation_token,
-    } = process.output_handles();
     let deadline = started_at + Duration::from_millis(yield_time_ms);
     let collected_output = UnifiedExecProcessManager::collect_output_until_deadline(
-        &output_buffer,
-        &output_notify,
-        &output_closed,
-        &output_closed_notify,
-        &cancellation_token,
+        process.output_handles(),
         Some(session.subscribe_elicitation_pause_state()),
         deadline,
     )
@@ -616,6 +608,7 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
         process_id,
         ProcessEntry {
             process,
+            plugin_metrics_sidecar: None,
             call_id: "call".to_string(),
             process_id,
             cwd: cwd.into(),
@@ -689,6 +682,7 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
         process_id,
         ProcessEntry {
             process: Arc::clone(&process),
+            plugin_metrics_sidecar: None,
             call_id: "call".to_string(),
             process_id,
             cwd: cwd.into(),
@@ -809,19 +803,8 @@ async fn unified_exec_uses_remote_exec_server_when_configured() -> anyhow::Resul
     process.write(b"printf 'remote-unified-exec\\n'\n").await?;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let crate::unified_exec::process::OutputHandles {
-        output_buffer,
-        output_notify,
-        output_closed,
-        output_closed_notify,
-        cancellation_token,
-    } = process.output_handles();
     let collected = UnifiedExecProcessManager::collect_output_until_deadline(
-        &output_buffer,
-        &output_notify,
-        &output_closed,
-        &output_closed_notify,
-        &cancellation_token,
+        process.output_handles(),
         /*pause_state*/ None,
         Instant::now() + Duration::from_millis(2_500),
     )

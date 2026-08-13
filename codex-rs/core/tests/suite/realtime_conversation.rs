@@ -2,10 +2,14 @@ use anyhow::Context;
 use anyhow::Result;
 use chrono::Utc;
 use codex_config::config_toml::RealtimeWsVersion;
+use codex_core::TurnInputRequest;
 use codex_core::test_support::auth_manager_from_auth;
+use codex_history::InitialHistory;
+use codex_history::RolloutItem;
 use codex_login::CodexAuth;
 use codex_login::OPENAI_API_KEY_ENV_VAR;
 use codex_protocol::ThreadId;
+use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::CodexErrorInfo;
@@ -15,7 +19,6 @@ use codex_protocol::protocol::ConversationStartTransport;
 use codex_protocol::protocol::ConversationTextParams;
 use codex_protocol::protocol::ConversationTextRole;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RealtimeAudioFrame;
 use codex_protocol::protocol::RealtimeConversationRealtimeEvent;
@@ -24,7 +27,6 @@ use codex_protocol::protocol::RealtimeEvent;
 use codex_protocol::protocol::RealtimeNoopRequested;
 use codex_protocol::protocol::RealtimeOutputModality;
 use codex_protocol::protocol::RealtimeVoice;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses;
@@ -2699,14 +2701,14 @@ async fn conversation_startup_context_current_thread_selects_many_turns_by_budge
             let turn_number = index + 1;
             let assistant_turn = format!("assistant turn {turn_number}");
             [
-                RolloutItem::ResponseItem(ResponseItem::Message {
+                ResponseItem::Message {
                     id: None,
                     role: "user".to_string(),
                     content: vec![ContentItem::InputText { text: user_turn }],
                     phase: None,
                     internal_chat_message_metadata_passthrough: None,
-                }),
-                RolloutItem::ResponseItem(ResponseItem::Message {
+                },
+                ResponseItem::Message {
                     id: None,
                     role: "assistant".to_string(),
                     content: vec![ContentItem::OutputText {
@@ -2714,8 +2716,9 @@ async fn conversation_startup_context_current_thread_selects_many_turns_by_budge
                     }],
                     phase: None,
                     internal_chat_message_metadata_passthrough: None,
-                }),
+                },
             ]
+            .map(|item| RolloutItem::ResponseItem(item.into()))
         })
         .collect::<Vec<_>>();
     test.codex.shutdown_and_wait().await?;
@@ -2726,7 +2729,7 @@ async fn conversation_startup_context_current_thread_selects_many_turns_by_budge
             InitialHistory::Forked(history),
             auth_manager_from_auth(CodexAuth::from_api_key("dummy")),
             /*parent_trace*/ None,
-            /*supports_openai_form_elicitation*/ false,
+            ClientMcpExtensions::default(),
         )
         .await?;
     let codex = resumed_thread.thread;
@@ -3052,16 +3055,10 @@ async fn conversation_user_text_turn_is_not_sent_to_realtime() -> Result<()> {
 
     let user_text = "typed follow-up for realtime";
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: user_text.to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: user_text.to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
 
     let turn_complete = wait_for_event_match(&test.codex, |event| match event {
@@ -4693,16 +4690,10 @@ async fn inbound_handoff_request_steers_active_turn() -> Result<()> {
     .await;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "first prompt".to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "first prompt".to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
 
     wait_for_event(&test.codex, |event| {

@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -16,13 +15,13 @@ use crate::catalog::SkillAuthority;
 use crate::catalog::SkillCatalog;
 use crate::catalog::SkillCatalogEntry;
 use crate::catalog::SkillPackageId;
-use crate::catalog::SkillProviderError;
 use crate::catalog::SkillProviderResult;
 use crate::catalog::SkillReadResult;
 use crate::catalog::SkillResourceId;
 use crate::catalog::SkillSourceKind;
 use crate::provider::SkillListQuery;
 use crate::provider::SkillReadRequest;
+use crate::shadow_selection_experiment::RecentSkillInvocations;
 use crate::shadow_selection_experiment::ShadowSelectionTurnState;
 use crate::sources::SkillProviders;
 
@@ -41,6 +40,7 @@ pub(crate) struct SkillsThreadState {
     executor_discovery_cache: Mutex<Option<CachedExecutorDiscoveryCatalog>>,
     orchestrator_cache: Mutex<Option<Arc<OrchestratorGenerationCache>>>,
     shadow_selection_turn: Mutex<Option<ShadowSelectionTurn>>,
+    pub(crate) recent_skill_invocations: Arc<RecentSkillInvocations>,
 }
 
 impl SkillsThreadState {
@@ -52,6 +52,7 @@ impl SkillsThreadState {
             executor_discovery_cache: Mutex::new(None),
             orchestrator_cache: Mutex::new(None),
             shadow_selection_turn: Mutex::new(None),
+            recent_skill_invocations: Arc::new(RecentSkillInvocations::default()),
         }
     }
 
@@ -175,18 +176,31 @@ impl SkillsThreadState {
         discovered
     }
 
+    #[tracing::instrument(
+        name = "skills.orchestrator.catalog_snapshot",
+        level = "info",
+        skip_all
+    )]
     pub(crate) async fn orchestrator_catalog_snapshot(
         &self,
-        mcp_resources: Option<&McpResourceClient>,
-        initialize: impl Future<Output = Result<SkillCatalog, SkillProviderError>> + Send,
+        providers: &SkillProviders,
+        query: SkillListQuery,
     ) -> SkillCatalog {
-        self.orchestrator_cache(mcp_resources)
+        if !query.include_orchestrator_skills {
+            return SkillCatalog::default();
+        }
+
+        let cache = self.orchestrator_cache(query.mcp_resources.as_deref());
+        cache
             .catalog
             .get_or_init(|| async {
-                initialize.await.unwrap_or_else(|err| SkillCatalog {
-                    warnings: vec![err.message],
-                    ..Default::default()
-                })
+                providers
+                    .list_orchestrator_for_turn(query)
+                    .await
+                    .unwrap_or_else(|err| SkillCatalog {
+                        warnings: vec![err.message],
+                        ..Default::default()
+                    })
             })
             .await
             .clone()
@@ -372,6 +386,9 @@ pub(crate) struct SkillsTurnState {
     pub(crate) warnings: Vec<String>,
     pub(crate) main_prompts_injected: bool,
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HostSkillsCatalogInWorldState;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ExecutorSkillsStepState(pub(crate) SkillCatalog);

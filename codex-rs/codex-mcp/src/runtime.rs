@@ -8,12 +8,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use async_channel::Sender;
+use codex_config::types::McpServerDisabledReason;
 use codex_connectors::ConnectorRuntimeContextKey;
 use codex_connectors::ConnectorRuntimeManager;
 use codex_exec_server::Environment;
@@ -24,9 +26,11 @@ use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::mcp::CallToolResult;
+use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::Event;
 use codex_rmcp_client::ElicitationResponse;
+use codex_rmcp_client::with_http_headers_helper;
 use codex_utils_path_uri::PathUri;
 use rmcp::model::ReadResourceRequestParams;
 use rmcp::model::ReadResourceResult;
@@ -46,8 +50,18 @@ use crate::server::EffectiveMcpServer;
 use crate::tool_catalog_cache::McpToolCatalogCache;
 use crate::tools::ToolInfo;
 
+/// Controls when one task starts its eligible MCP servers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpStartupPolicy {
+    /// Start configured servers when their task's MCP runtime is published.
+    Eager,
+    /// Start servers with cached tool definitions on first use.
+    LazyWhenCached,
+}
+
 /// Everything needed to materialize one exact MCP configuration.
 pub struct McpRuntimeInput {
+    pub startup_policy: McpStartupPolicy,
     pub config: Arc<McpConfig>,
     pub plugins_available: bool,
     pub ready_selected_capability_roots: Vec<SelectedCapabilityRoot>,
@@ -59,7 +73,7 @@ pub struct McpRuntimeInput {
     pub codex_apps_tools_cache: ConnectorRuntimeManager<ToolInfo>,
     pub tool_catalog_cache: McpToolCatalogCache,
     pub codex_apps_tools_cache_key: ConnectorRuntimeContextKey,
-    pub supports_openai_form_elicitation: bool,
+    pub client_mcp_extensions: ClientMcpExtensions,
     pub auth: Option<CodexAuth>,
     pub codex_apps_auth_manager: Option<Arc<AuthManager>>,
     pub elicitation_reviewer: Option<ElicitationReviewerHandle>,
@@ -83,6 +97,12 @@ struct PublishedMcpRuntime {
     auth_token: Option<String>,
     plugins_available: bool,
     ready_selected_capability_roots: Vec<SelectedCapabilityRoot>,
+    cached_binding: Mutex<Option<CachedMcpBinding>>,
+}
+
+struct CachedMcpBinding {
+    catalog_revision: u64,
+    binding: Arc<McpBinding>,
 }
 
 struct McpReconnectGuard<'a> {
@@ -147,6 +167,7 @@ impl McpRuntime {
                 auth_token: None,
                 plugins_available: false,
                 ready_selected_capability_roots: Vec::new(),
+                cached_binding: Mutex::new(None),
             }),
             reconnect_pending: AtomicBool::new(false),
             elicitation_router: ElicitationRequestRouter::default(),
@@ -203,6 +224,7 @@ impl McpRuntime {
             auth_token,
             plugins_available,
             ready_selected_capability_roots,
+            cached_binding: Mutex::new(None),
         }));
         let _ = publish.send(true);
     }
@@ -222,14 +244,51 @@ impl McpRuntime {
         &self,
         required_servers: &[String],
     ) -> Option<Arc<McpBinding>> {
-        let current = self.current.load_full();
+        Self::binding_from_published_runtime(self.current.load_full(), required_servers).await
+    }
+
+    async fn binding_from_published_runtime(
+        current: Arc<PublishedMcpRuntime>,
+        required_servers: &[String],
+    ) -> Option<Arc<McpBinding>> {
         let config = Arc::clone(current.config.as_ref()?);
-        Some(Arc::new(
+        let stable_catalog_revision = current.connections.stable_catalog_revision().await;
+        if let Some(catalog_revision) = stable_catalog_revision {
+            let cached = current
+                .cached_binding
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cached) = cached.as_ref()
+                && cached.catalog_revision == catalog_revision
+            {
+                return Some(Arc::clone(&cached.binding));
+            }
+        }
+
+        let binding = Arc::new(
             current
                 .connections
                 .capture_binding_with_metadata(config, current.plugins_available, required_servers)
                 .await,
-        ))
+        );
+        if let Some(catalog_revision) = stable_catalog_revision
+            && current.connections.stable_catalog_revision().await == Some(catalog_revision)
+        {
+            let mut cached = current
+                .cached_binding
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cached) = cached.as_ref()
+                && cached.catalog_revision == catalog_revision
+            {
+                return Some(Arc::clone(&cached.binding));
+            }
+            *cached = Some(CachedMcpBinding {
+                catalog_revision,
+                binding: Arc::clone(&binding),
+            });
+        }
+        Some(binding)
     }
 
     /// Returns whether the published snapshot still belongs to the current credentials.
@@ -248,6 +307,29 @@ impl McpRuntime {
         }
     }
 
+    /// Detects newly saved credentials for servers whose startup failed authentication.
+    pub async fn updated_oauth_credentials_after_auth_failure(&self) -> Vec<String> {
+        let current = self.current.load_full();
+        let Some(config) = current.config.as_ref() else {
+            return Vec::new();
+        };
+        current
+            .connections
+            .updated_oauth_credentials_after_auth_failure(config)
+            .await
+    }
+
+    /// Checks the current generation before retrying servers detected outside the refresh gate.
+    pub async fn has_authentication_failed_servers(&self, server_names: &[String]) -> bool {
+        self.current
+            .load_full()
+            .connections
+            .authentication_failed_servers()
+            .await
+            .into_iter()
+            .any(|server_name| server_names.contains(&server_name))
+    }
+
     /// Waits for the selected server without capturing an execution binding.
     pub async fn wait_for_server_startup(&self, server: &str) {
         self.current
@@ -260,16 +342,11 @@ impl McpRuntime {
     /// Captures the current runtime after its selected server has finished startup.
     pub async fn current_binding_for_call(&self, server: &str) -> Option<Arc<McpBinding>> {
         let current = self.current.load_full();
-        let config = Arc::clone(current.config.as_ref()?);
+        current.config.as_ref()?;
         if !current.connections.wait_for_server_startup(server).await {
             return None;
         }
-        Some(Arc::new(
-            current
-                .connections
-                .capture_binding_with_metadata(config, current.plugins_available, &[])
-                .await,
-        ))
+        Self::binding_from_published_runtime(current, /*required_servers*/ &[]).await
     }
 
     /// Returns the latest published configuration without waiting for clients.
@@ -287,6 +364,10 @@ impl McpRuntime {
 
     pub fn set_elicitations_auto_deny(&self, auto_deny: bool) {
         self.elicitation_router.set_auto_deny(auto_deny);
+    }
+
+    pub fn enable_full_access_form_input(&self) {
+        self.elicitation_router.enable_full_access_form_input();
     }
 
     pub async fn resolve_elicitation(
@@ -374,30 +455,57 @@ pub struct SandboxState {
 /// Runtime context used when resolving per-server MCP environments.
 ///
 /// `McpConfig` describes what servers exist. This value carries the canonical
-/// environment registry plus the local stdio fallback cwd used when a local
-/// stdio server omits its own working directory.
+/// environment registry plus the host-local cwd used by local MCP processes.
 #[derive(Clone)]
 pub struct McpRuntimeContext {
     environment_manager: Arc<EnvironmentManager>,
-    local_stdio_fallback_cwd: PathBuf,
+    local_process_cwd: PathBuf,
+}
+
+/// Applies the local HTTP headers helper configured for an MCP server.
+///
+/// Callers retain ownership of selecting the underlying HTTP transport. This
+/// function centralizes the helper-specific policy checks and decoration used
+/// by both MCP runtime startup and standalone OAuth login.
+pub fn apply_http_headers_helper(
+    client: Arc<dyn HttpClient>,
+    config: &codex_config::McpServerConfig,
+    local_process_cwd: PathBuf,
+) -> Result<Arc<dyn HttpClient>, String> {
+    let codex_config::McpServerTransportConfig::StreamableHttp {
+        url,
+        http_headers_helper: Some(command),
+        ..
+    } = &config.transport
+    else {
+        return Ok(client);
+    };
+    if matches!(
+        config.disabled_reason,
+        Some(McpServerDisabledReason::Requirements { .. })
+    ) {
+        return Err("the MCP server is disabled by managed requirements".to_string());
+    }
+    if !config.is_local_environment() {
+        return Err("HTTP headers helpers can only run in the local environment".to_string());
+    }
+    with_http_headers_helper(client, url, command, local_process_cwd)
+        .map_err(|error| error.to_string())
 }
 
 impl McpRuntimeContext {
-    pub fn new(
-        environment_manager: Arc<EnvironmentManager>,
-        local_stdio_fallback_cwd: PathBuf,
-    ) -> Self {
+    pub fn new(environment_manager: Arc<EnvironmentManager>, local_process_cwd: PathBuf) -> Self {
         Self {
             environment_manager,
-            local_stdio_fallback_cwd,
+            local_process_cwd,
         }
     }
 
-    pub(crate) fn local_stdio_fallback_cwd(&self) -> PathBuf {
-        self.local_stdio_fallback_cwd.clone()
+    pub(crate) fn local_process_cwd(&self) -> PathBuf {
+        self.local_process_cwd.clone()
     }
 
-    pub(crate) fn local_http_client(&self) -> Arc<dyn HttpClient> {
+    fn local_http_client(&self) -> Arc<dyn HttpClient> {
         Arc::new(RouteAwareHttpClient::new(
             self.environment_manager.http_client_factory().clone(),
         ))
@@ -439,12 +547,20 @@ impl McpRuntimeContext {
         server_name: &str,
         config: &codex_config::McpServerConfig,
     ) -> Result<Arc<dyn HttpClient>, String> {
-        Ok(self
-            .resolve_server_environment(server_name, config)?
-            .map_or_else(
-                || self.local_http_client(),
-                |environment| environment.get_http_client(),
-            ))
+        let environment = self.resolve_server_environment(server_name, config)?;
+        self.http_client_for_server(config, environment.as_ref())
+    }
+
+    pub(crate) fn http_client_for_server(
+        &self,
+        config: &codex_config::McpServerConfig,
+        environment: Option<&Arc<Environment>>,
+    ) -> Result<Arc<dyn HttpClient>, String> {
+        let client = environment.map_or_else(
+            || self.local_http_client(),
+            |environment| environment.get_http_client(),
+        );
+        apply_http_headers_helper(client, config, self.local_process_cwd())
     }
 }
 
@@ -483,6 +599,7 @@ mod tests {
             enabled: true,
             required: false,
             supports_parallel_tool_calls: false,
+            omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
             tool_timeout_sec: None,
@@ -511,6 +628,45 @@ mod tests {
         assert!(!gate.wait().await);
     }
 
+    #[tokio::test]
+    async fn cached_bindings_are_scoped_to_the_published_runtime() {
+        let published = Arc::new(PublishedMcpRuntime {
+            connections: Arc::new(McpConnectionSet::empty(/*prefix_mcp_tool_names*/ true)),
+            config: Some(Arc::new(crate::mcp::tests::test_mcp_config(
+                std::env::temp_dir(),
+            ))),
+            auth: None,
+            auth_token: None,
+            plugins_available: false,
+            ready_selected_capability_roots: Vec::new(),
+            cached_binding: Mutex::new(None),
+        });
+        let first = McpRuntime::binding_from_published_runtime(
+            Arc::clone(&published),
+            /*required_servers*/ &[],
+        )
+        .await
+        .expect("first binding");
+        let repeated = McpRuntime::binding_from_published_runtime(
+            Arc::clone(&published),
+            /*required_servers*/ &[],
+        )
+        .await
+        .expect("repeated binding");
+        assert!(Arc::ptr_eq(&first, &repeated));
+
+        let previous = Arc::into_inner(published).expect("published runtime has no other owners");
+        let republished = Arc::new(PublishedMcpRuntime {
+            cached_binding: Mutex::new(None),
+            ..previous
+        });
+        let refreshed =
+            McpRuntime::binding_from_published_runtime(republished, /*required_servers*/ &[])
+                .await
+                .expect("republished binding");
+        assert!(!Arc::ptr_eq(&first, &refreshed));
+    }
+
     fn http_server(environment_id: &str) -> McpServerConfig {
         McpServerConfig {
             auth: Default::default(),
@@ -519,6 +675,7 @@ mod tests {
                 bearer_token_env_var: None,
                 http_headers: None,
                 env_http_headers: None,
+                http_headers_helper: None,
             },
             environment_id: environment_id.to_string(),
             ..stdio_server(environment_id)
@@ -662,6 +819,24 @@ mod tests {
             };
             assert!(resolved_runtime.is_some());
         }
+
+        let mut remote_http_with_helper = http_server("remote");
+        let McpServerTransportConfig::StreamableHttp {
+            http_headers_helper,
+            ..
+        } = &mut remote_http_with_helper.transport
+        else {
+            unreachable!("HTTP helper should build streamable HTTP transport");
+        };
+        *http_headers_helper = Some("helper-that-must-not-run".to_string());
+        let error = match runtime_context.resolve_http_client("http", &remote_http_with_helper) {
+            Ok(_) => panic!("remote HTTP helper should be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            "HTTP headers helpers can only run in the local environment"
+        );
     }
 
     #[tokio::test]

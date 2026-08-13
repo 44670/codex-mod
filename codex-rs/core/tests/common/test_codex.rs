@@ -18,6 +18,7 @@ use codex_core::CodexThread;
 use codex_core::StartThreadOptions;
 use codex_core::ThreadManager;
 use codex_core::TimeProvider;
+pub use codex_core::TurnInputRequest;
 use codex_core::config::Config;
 use codex_core::resolve_installation_id;
 use codex_core::shell::Shell;
@@ -36,12 +37,17 @@ use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
 use codex_models_manager::bundled_models_response;
+use codex_models_manager::manager::SharedModelsManager;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
+use codex_protocol::mcp::ClientMcpExtensions;
+use codex_protocol::mcp::OPENAI_FORM_EXTENSION_ID;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RealtimeConversationVersion as RealtimeWsVersion;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
@@ -306,6 +312,7 @@ pub struct TestCodexBuilder {
     external_time_provider: Option<Arc<dyn TimeProvider>>,
     code_mode_host_program: Option<PathBuf>,
     history_mode: Option<ThreadHistoryMode>,
+    models_manager: Option<SharedModelsManager>,
 }
 
 impl TestCodexBuilder {
@@ -319,6 +326,11 @@ impl TestCodexBuilder {
 
     pub fn with_auth(mut self, auth: CodexAuth) -> Self {
         self.auth = auth;
+        self
+    }
+
+    pub fn with_models_manager(mut self, models_manager: SharedModelsManager) -> Self {
+        self.models_manager = Some(models_manager);
         self
     }
 
@@ -641,10 +653,14 @@ impl TestCodexBuilder {
                 ))
             });
         let auth_manager = codex_core::test_support::auth_manager_from_auth(auth.clone());
+        let models_manager = self
+            .models_manager
+            .clone()
+            .unwrap_or_else(|| codex_core::build_models_manager(&config, auth_manager.clone()));
         let thread_manager = ThreadManager::new(
             &config,
             auth_manager.clone(),
-            codex_core::build_models_manager(&config, auth_manager),
+            models_manager,
             codex_core::CodexAppsToolsCache::default(),
             SessionSource::Exec,
             Arc::clone(&environment_manager),
@@ -674,6 +690,12 @@ impl TestCodexBuilder {
         };
         let thread_manager = Arc::new(thread_manager);
         let user_shell_override = self.user_shell_override.clone();
+        let client_mcp_extensions = || {
+            ClientMcpExtensions::new(
+                self.supports_openai_form_elicitation
+                    .then(|| (OPENAI_FORM_EXTENSION_ID.to_string(), serde_json::json!({}))),
+            )
+        };
 
         let new_conversation = match (resume_from, user_shell_override) {
             (Some(path), Some(user_shell_override)) => {
@@ -697,7 +719,7 @@ impl TestCodexBuilder {
                     path,
                     auth_manager,
                     /*parent_trace*/ None,
-                    self.supports_openai_form_elicitation,
+                    client_mcp_extensions(),
                 ))
                 .await?
             }
@@ -715,7 +737,7 @@ impl TestCodexBuilder {
             (None, None) => {
                 Box::pin(thread_manager.start_thread(StartThreadOptions {
                     history_mode: self.history_mode,
-                    supports_openai_form_elicitation: self.supports_openai_form_elicitation,
+                    client_mcp_extensions: client_mcp_extensions(),
                     ..StartThreadOptions::new(config.clone())
                 }))
                 .await?
@@ -851,16 +873,10 @@ impl TestCodex {
     /// Submits a text turn without changing the current thread settings.
     pub async fn submit_text_turn(&self, prompt: &str) -> Result<()> {
         self.codex
-            .submit(Op::UserInput {
-                items: vec![UserInput::Text {
-                    text: prompt.into(),
-                    text_elements: Vec::new(),
-                }],
-                final_output_json_schema: None,
-                responsesapi_client_metadata: None,
-                additional_context: Default::default(),
-                thread_settings: ThreadSettingsOverrides::default(),
-            })
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: prompt.into(),
+                text_elements: Vec::new(),
+            }]))
             .await?;
 
         wait_for_event(&self.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -988,31 +1004,28 @@ impl TestCodex {
             TurnEnvironmentSelections::new(self.config.cwd.clone(), environments)
         });
         self.codex
-            .submit(Op::UserInput {
-                items: vec![UserInput::Text {
+            .start_or_steer_turn(
+                TurnInputRequest::user_input(vec![UserInput::Text {
                     text: prompt.into(),
                     text_elements: Vec::new(),
-                }],
-                final_output_json_schema: None,
-                responsesapi_client_metadata: None,
-                additional_context: Default::default(),
-                thread_settings: ThreadSettingsOverrides {
+                }])
+                .with_thread_settings(ThreadSettingsOverrides {
                     environments: turn_environment_selections,
                     approval_policy: Some(approval_policy),
                     sandbox_policy: Some(sandbox_policy),
                     permission_profile,
                     service_tier,
-                    collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                        mode: codex_protocol::config_types::ModeKind::Default,
-                        settings: codex_protocol::config_types::Settings {
+                    collaboration_mode: Some(CollaborationMode {
+                        mode: ModeKind::Default,
+                        settings: Settings {
                             model: session_model,
                             reasoning_effort: None,
                             developer_instructions: None,
                         },
                     }),
                     ..Default::default()
-                },
-            })
+                }),
+            )
             .await?;
 
         let turn_id = wait_for_event_match(&self.codex, |event| match event {
@@ -1273,6 +1286,7 @@ pub fn test_codex() -> TestCodexBuilder {
         external_time_provider: None,
         code_mode_host_program: None,
         history_mode: None,
+        models_manager: None,
     }
 }
 

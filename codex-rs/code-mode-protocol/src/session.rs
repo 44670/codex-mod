@@ -23,6 +23,13 @@ pub type ToolInvocationFuture<'a> =
     Pin<Box<dyn Future<Output = Result<JsonValue, String>> + Send + 'a>>;
 pub type NotificationFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
+/// Optional resource limits shared by every cell in one code-mode session.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CodeModeSessionCellExecutionLimits {
+    pub max_yield_time_ms: Option<u64>,
+    pub max_heap_size_bytes: Option<usize>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct CellId(String);
 
@@ -55,27 +62,31 @@ pub struct StartedCell {
 
 impl StartedCell {
     pub fn new(cell_id: CellId, initial_response_rx: oneshot::Receiver<RuntimeResponse>) -> Self {
-        Self {
-            cell_id,
-            initial_response: Box::pin(async move {
-                initial_response_rx
-                    .await
-                    .map_err(|_| "exec runtime ended unexpectedly".to_string())
-            }),
-        }
+        Self::from_future(cell_id, async move {
+            initial_response_rx
+                .await
+                .map_err(|_| "exec runtime ended unexpectedly".to_string())
+        })
     }
 
     pub fn from_result_receiver(
         cell_id: CellId,
         initial_response_rx: oneshot::Receiver<Result<RuntimeResponse, String>>,
     ) -> Self {
+        Self::from_future(cell_id, async move {
+            initial_response_rx
+                .await
+                .map_err(|_| "exec runtime ended unexpectedly".to_string())?
+        })
+    }
+
+    pub fn from_future(
+        cell_id: CellId,
+        initial_response: impl Future<Output = Result<RuntimeResponse, String>> + Send + 'static,
+    ) -> Self {
         Self {
             cell_id,
-            initial_response: Box::pin(async move {
-                initial_response_rx
-                    .await
-                    .map_err(|_| "exec runtime ended unexpectedly".to_string())?
-            }),
+            initial_response: Box::pin(initial_response),
         }
     }
 
@@ -164,6 +175,24 @@ pub trait CodeModeSessionProvider: Send + Sync {
         &'a self,
         delegate: Arc<dyn CodeModeSessionDelegate>,
     ) -> CodeModeSessionProviderFuture<'a>;
+
+    /// Creates a session whose cells share the supplied execution limits.
+    ///
+    /// Existing providers remain compatible with unlimited sessions, but must
+    /// explicitly implement this method before accepting non-default limits.
+    fn create_session_with_limits<'a>(
+        &'a self,
+        delegate: Arc<dyn CodeModeSessionDelegate>,
+        limits: CodeModeSessionCellExecutionLimits,
+    ) -> CodeModeSessionProviderFuture<'a> {
+        if limits == CodeModeSessionCellExecutionLimits::default() {
+            self.create_session(delegate)
+        } else {
+            Box::pin(async {
+                Err("code-mode session provider does not support resource limits".to_string())
+            })
+        }
+    }
 }
 
 #[cfg(test)]

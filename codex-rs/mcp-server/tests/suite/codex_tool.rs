@@ -476,7 +476,12 @@ async fn codex_tool_passes_base_instructions() -> anyhow::Result<()> {
             .count(),
         1
     );
-    assert_eq!(developer_text.matches("Generated with Codex.").count(), 1);
+    assert_eq!(
+        developer_text
+            .matches("Generated with [Codex](https://openai.com/codex/).")
+            .count(),
+        1
+    );
     assert_eq!(
         developer_text.matches("- demo: Demo skill.").count(),
         1,
@@ -559,7 +564,11 @@ async fn codex_tool_forwards_skills_extension_warnings() -> anyhow::Result<()> {
         warning_json["params"]["_meta"]["requestId"],
         codex_request_id
     );
-    assert_eq!(warning_json["params"]["id"], codex_request_id.to_string());
+    assert!(
+        warning_json["params"]["id"]
+            .as_str()
+            .is_some_and(|turn_id| !turn_id.is_empty())
+    );
     assert!(
         warning_json["params"]["_meta"]["threadId"]
             .as_str()

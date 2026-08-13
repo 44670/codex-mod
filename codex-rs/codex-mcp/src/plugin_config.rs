@@ -10,6 +10,11 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use tracing::warn;
 
+#[path = "agent_plugin_config.rs"]
+mod agent_plugin_config;
+
+pub use agent_plugin_config::parse_agent_plugin_mcp_config;
+
 #[derive(Clone, Copy, Debug)]
 enum PluginMcpSource<'a> {
     Host {
@@ -58,6 +63,9 @@ impl PluginMcpFile {
 }
 
 /// Parses the two supported plugin MCP file shapes and normalizes each server.
+///
+/// Native plugin HTTP servers share the regular MCP transport configuration;
+/// relative helper commands therefore use the session's local process cwd.
 ///
 /// Invalid individual servers are returned as errors without discarding valid
 /// siblings. A malformed top-level document fails the whole parse.

@@ -9,6 +9,8 @@ use crate::branch_summary;
 use crate::chatwidget::limit_label_for_window;
 use crate::chatwidget::rate_limits::get_limits_duration;
 use crate::legacy_core::config::Config;
+use crate::status::format_credit_micros;
+use crate::status::format_estimated_usd_micros;
 use crate::status::format_tokens_compact;
 use codex_app_server_protocol::AskForApproval;
 use codex_config::ConfigLayerSource;
@@ -70,6 +72,20 @@ impl StatusSurfaceSelections {
     fn uses_workspace_headline(&self) -> bool {
         self.status_line_items
             .contains(&StatusLineItem::WorkspaceHeadline)
+    }
+
+    fn uses_thread_usage(&self) -> bool {
+        self.status_line_items.iter().any(|item| {
+            matches!(
+                item,
+                StatusLineItem::ThreadCredits | StatusLineItem::EstimatedThreadCost
+            )
+        }) || self.terminal_title_items.iter().any(|item| {
+            matches!(
+                item,
+                TerminalTitleItem::ThreadCredits | TerminalTitleItem::EstimatedThreadCost
+            )
+        })
     }
 }
 
@@ -171,6 +187,12 @@ impl ChatWidget {
             self.status_line_workspace_messages_disabled = false;
         } else {
             self.request_status_line_workspace_headline_if_due(Instant::now());
+        }
+
+        if selections.uses_thread_usage() {
+            self.ensure_thread_usage_requested();
+        } else {
+            self.cancel_thread_usage_polling();
         }
     }
 
@@ -448,11 +470,7 @@ impl ChatWidget {
 
         self.config
             .config_layer_stack
-            .get_layers(
-                ConfigLayerStackOrdering::LowestPrecedenceFirst,
-                /*include_disabled*/ true,
-            )
-            .iter()
+            .all_layers_low_to_high()
             .find_map(|layer| match &layer.name {
                 ConfigLayerSource::Project { dot_codex_folder } => {
                     dot_codex_folder.as_path().parent().map(Path::to_path_buf)
@@ -719,14 +737,26 @@ impl ChatWidget {
             StatusLineItem::ContextWindowSize => self
                 .status_line_context_window_size()
                 .map(|cws| format!("{} window", format_tokens_compact(cws))),
-            StatusLineItem::TotalInputTokens => Some(format!(
-                "{} in",
-                format_tokens_compact(self.status_line_total_usage().input_tokens)
-            )),
-            StatusLineItem::TotalOutputTokens => Some(format!(
-                "{} out",
-                format_tokens_compact(self.status_line_total_usage().output_tokens)
-            )),
+            StatusLineItem::TotalInputTokens => (!self.token_usage_pending).then(|| {
+                format!(
+                    "{} in",
+                    format_tokens_compact(self.status_line_total_usage().input_tokens)
+                )
+            }),
+            StatusLineItem::TotalOutputTokens => (!self.token_usage_pending).then(|| {
+                format!(
+                    "{} out",
+                    format_tokens_compact(self.status_line_total_usage().output_tokens)
+                )
+            }),
+            StatusLineItem::ThreadCredits => self
+                .estimated_thread_usage()
+                .map(|usage| usage.estimated_usage_credits_micros)
+                .map(|credits| format!("{} credits", format_credit_micros(credits))),
+            StatusLineItem::EstimatedThreadCost => self
+                .estimated_thread_usage()
+                .and_then(|usage| usage.estimated_usage_usd_micros)
+                .and_then(format_estimated_usd_micros),
             StatusLineItem::SessionId => self.thread_id.map(|id| id.to_string()),
             StatusLineItem::FastMode => Some(
                 if self.current_service_tier() == Some(ServiceTier::Fast.request_value()) {
@@ -785,6 +815,8 @@ impl ChatWidget {
             StatusSurfacePreviewItem::UsedTokens => StatusLineItem::UsedTokens,
             StatusSurfacePreviewItem::TotalInputTokens => StatusLineItem::TotalInputTokens,
             StatusSurfacePreviewItem::TotalOutputTokens => StatusLineItem::TotalOutputTokens,
+            StatusSurfacePreviewItem::ThreadCredits => StatusLineItem::ThreadCredits,
+            StatusSurfacePreviewItem::EstimatedThreadCost => StatusLineItem::EstimatedThreadCost,
             StatusSurfacePreviewItem::SessionId => StatusLineItem::SessionId,
             StatusSurfacePreviewItem::FastMode => StatusLineItem::FastMode,
             StatusSurfacePreviewItem::RawOutput => StatusLineItem::RawOutput,
@@ -842,6 +874,12 @@ impl ChatWidget {
                 .map(|value| Self::truncate_terminal_title_part(value, /*max_chars*/ 32)),
             TerminalTitleItem::TotalOutputTokens => self
                 .status_line_value_for_item(StatusLineItem::TotalOutputTokens)
+                .map(|value| Self::truncate_terminal_title_part(value, /*max_chars*/ 32)),
+            TerminalTitleItem::ThreadCredits => self
+                .status_line_value_for_item(StatusLineItem::ThreadCredits)
+                .map(|value| Self::truncate_terminal_title_part(value, /*max_chars*/ 32)),
+            TerminalTitleItem::EstimatedThreadCost => self
+                .status_line_value_for_item(StatusLineItem::EstimatedThreadCost)
                 .map(|value| Self::truncate_terminal_title_part(value, /*max_chars*/ 32)),
             TerminalTitleItem::SessionId => self
                 .status_line_value_for_item(StatusLineItem::SessionId)

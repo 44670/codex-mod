@@ -36,10 +36,8 @@ impl ChatWidget {
         let mut config = config;
         config.model = model.clone();
         let prevent_idle_sleep = config.features.enabled(Feature::PreventIdleSleep);
-        let mut rng = rand::rng();
-        let placeholder = PLACEHOLDERS[rng.random_range(0..PLACEHOLDERS.len())].to_string();
-        let side_placeholder =
-            SIDE_PLACEHOLDERS[rng.random_range(0..SIDE_PLACEHOLDERS.len())].to_string();
+        let placeholder = PLACEHOLDER.to_string();
+        let side_placeholder = SIDE_PLACEHOLDER.to_string();
 
         let model_override = model.as_deref();
         let model_for_header = model
@@ -128,6 +126,7 @@ impl ChatWidget {
             runtime_model_provider_base_url,
             remote_connection: None,
             token_info: None,
+            token_usage_pending: false,
             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
             refreshing_status_outputs: Vec::new(),
             next_status_refresh_request_id: 0,
@@ -247,6 +246,7 @@ impl ChatWidget {
             next_status_line_workspace_headline_request_id: 0,
             status_line_workspace_headline_last_requested_at: None,
             status_line_workspace_messages_disabled: false,
+            thread_usage: thread_usage::ThreadUsageState::default(),
             current_goal_status_indicator: None,
             current_goal_status: None,
             external_editor_state: ExternalEditorState::Closed,

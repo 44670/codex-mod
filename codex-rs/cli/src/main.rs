@@ -51,6 +51,7 @@ mod doctor;
 mod exec_server_telemetry;
 mod marketplace_cmd;
 mod mcp_cmd;
+mod migrate_rollouts;
 mod plugin_cmd;
 mod remote_control_cmd;
 #[cfg(target_os = "windows")]
@@ -185,6 +186,9 @@ enum Subcommand {
 
     /// Permanently delete a saved session by id or session name.
     Delete(DeleteCommand),
+
+    /// Inspect or migrate legacy local sessions to paginated thread history.
+    MigrateRollouts(migrate_rollouts::MigrateRolloutsCommand),
 
     /// Unarchive a saved session by id or session name.
     Unarchive(SessionArchiveCommand),
@@ -568,6 +572,14 @@ struct ExecServerCommand {
     /// Error out when config.toml contains fields that are not recognized by this version of Codex.
     #[arg(long = "strict-config", default_value_t = false)]
     strict_config: bool,
+
+    /// Maximum number of requests to process concurrently on each connection.
+    #[arg(
+        long = "concurrent-requests",
+        value_name = "COUNT",
+        default_value = "1"
+    )]
+    request_dispatch_mode: codex_exec_server::RequestDispatchMode,
 
     /// Transport endpoint URL. Supported values: `ws://IP:PORT` (default), `stdio`, `stdio://`.
     #[arg(long = "listen", value_name = "URL", conflicts_with = "remote")]
@@ -983,7 +995,6 @@ async fn cli_main(
         mut interactive,
         subcommand,
     } = MultitoolCli::parse();
-
     // Fold --enable/--disable into config overrides so they flow to all subcommands.
     let toggle_overrides = feature_toggles.to_overrides()?;
     root_config_overrides.raw_overrides.extend(toggle_overrides);
@@ -1320,6 +1331,14 @@ async fn cli_main(
             )
             .await?;
             println!("{output}");
+        }
+        Some(Subcommand::MigrateRollouts(command)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "migrate-rollouts",
+            )?;
+            migrate_rollouts::run(command, root_config_overrides).await?;
         }
         Some(Subcommand::Unarchive(cmd)) => {
             let output = run_session_archive_cli_command(
@@ -1735,6 +1754,7 @@ async fn run_exec_server_command(
         if let Some(name) = cmd.name {
             remote_config.name = name;
         }
+        remote_config.request_dispatch_mode = cmd.request_dispatch_mode;
         let remote_config = remote_config.with_telemetry(telemetry);
         let parent_lifetime = if cmd.exit_on_stdin_close {
             exec_server_telemetry::ParentLifetime::StdinPipe
@@ -1784,6 +1804,7 @@ async fn run_exec_server_command(
                     runtime_paths,
                     telemetry,
                     http_client_factory,
+                    cmd.request_dispatch_mode,
                 )
                 .await
             },
@@ -1801,16 +1822,19 @@ async fn load_exec_server_remote_auth_provider(
     use_agent_identity_auth: bool,
 ) -> anyhow::Result<codex_api::SharedAuthProvider> {
     if use_agent_identity_auth {
-        let agent_identity_jwt = read_codex_access_token_from_env().ok_or_else(|| {
+        read_codex_access_token_from_env().ok_or_else(|| {
             anyhow::anyhow!("CODEX_ACCESS_TOKEN is required when --use-agent-identity-auth is set")
         })?;
-        let auth_route_config = config.auth_route_config();
-        let auth = CodexAuth::from_agent_identity_jwt(
-            &agent_identity_jwt,
-            Some(&config.chatgpt_base_url),
-            &auth_route_config,
-        )
-        .await?;
+        let auth = AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false)
+            .await
+            .auth()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Agent Identity authentication is unavailable"))?;
+        if !matches!(auth, CodexAuth::AgentIdentity(_)) {
+            anyhow::bail!(
+                "CODEX_ACCESS_TOKEN did not provide permitted Agent Identity authentication"
+            );
+        }
         return Ok(codex_model_provider::auth_provider_from_auth(&auth));
     }
 
@@ -2222,6 +2246,7 @@ fn unsupported_subcommand_name_for_strict_config(
         Some(Subcommand::RemoteControl(remote_control)) => Some(remote_control.subcommand_name()),
         Some(Subcommand::Mcp(_)) => Some("mcp"),
         Some(Subcommand::Plugin(_)) => Some("plugin"),
+        Some(Subcommand::MigrateRollouts(_)) => Some("migrate-rollouts"),
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         Some(Subcommand::App(_)) => Some("app"),
         Some(Subcommand::Login(_)) => Some("login"),
@@ -4046,17 +4071,44 @@ mod tests {
     }
 
     #[test]
+    fn app_server_grpc_code_mode_host_url_parses_independently_of_listen_transport() {
+        let app_server = app_server_from_args(
+            [
+                "codex",
+                "app-server",
+                "--code-mode-host",
+                "https://example.test",
+                "--listen",
+                "ws://127.0.0.1:4500",
+            ]
+            .as_ref(),
+        );
+
+        assert_eq!(
+            app_server.code_mode_host.code_mode_host,
+            Some(url::Url::parse("https://example.test").expect("test endpoint should parse"))
+        );
+    }
+
+    #[test]
     fn app_server_rejects_invalid_code_mode_host_urls() {
         for endpoint in [
-            "http://127.0.0.1:8765",
+            "ftp://127.0.0.1:8765",
             "ws://",
             "wss://example.test/code-mode#fragment",
+            "https://example.test/code-mode",
+            "http://alice:secret@example.test",
+            "https://alice:secret@example.test",
+            "http://example.test/?token=secret",
         ] {
             let error =
                 MultitoolCli::try_parse_from(["codex", "app-server", "--code-mode-host", endpoint])
                     .expect_err("invalid code-mode host endpoint should fail argument parsing");
 
             assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+            let rendered_error = error.to_string();
+            assert!(!rendered_error.contains("alice"));
+            assert!(!rendered_error.contains("secret"));
         }
     }
 

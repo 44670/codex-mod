@@ -60,15 +60,15 @@ async fn handle_spawn_agent(
 
     let session_source = turn.session_source.clone();
     let child_depth = next_thread_spawn_depth(&session_source);
-    let mut config =
-        build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
+    let mut config = build_agent_spawn_config(
+        &session.get_base_instructions().await,
+        turn.as_ref(),
+        step_context.environments.primary(),
+    )?;
     if let Some(service_tier) = args.service_tier.as_ref() {
         config.service_tier = Some(service_tier.clone());
     }
     let is_full_history_fork = matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory));
-    if is_full_history_fork {
-        reject_full_fork_agent_type_override(role_name)?;
-    }
     apply_requested_spawn_agent_model_overrides(
         &session,
         turn.as_ref(),
@@ -77,8 +77,13 @@ async fn handle_spawn_agent(
         args.reasoning_effort.clone(),
     )
     .await?;
-    if !is_full_history_fork {
+    if !is_full_history_fork || role_name.is_some() {
         apply_spawn_agent_role(&session, &mut config, role_name).await?;
+        if is_full_history_fork && config.developer_instructions.is_none() {
+            config
+                .developer_instructions
+                .clone_from(&turn.developer_instructions);
+        }
     }
     apply_spawn_agent_service_tier(
         &session,
@@ -87,7 +92,11 @@ async fn handle_spawn_agent(
         args.service_tier.as_deref(),
     )
     .await?;
-    apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
+    apply_spawn_agent_runtime_overrides(
+        &mut config,
+        turn.as_ref(),
+        step_context.environments.primary(),
+    )?;
 
     let spawn_source = thread_spawn_source(
         session.thread_id,
@@ -127,6 +136,7 @@ async fn handle_spawn_agent(
                     fork_mode,
                     parent_thread_id: Some(session.thread_id),
                     parent_turn_id: Some(turn.sub_id.clone()),
+                    root_turn_id: turn.turn_metadata_state.root_turn_id(),
                     environments: Some(step_context.environments.to_selections()),
                 },
             ),

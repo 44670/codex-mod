@@ -16,7 +16,6 @@ use codex_config::ConfigLayerEntry;
 use codex_config::ConfigLayerMetadata;
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStack;
-use codex_config::ConfigLayerStackOrdering;
 use codex_config::ConfigRequirementsToml;
 use codex_config::ShellEnvironmentPolicyFilterRepresentation;
 use codex_config::config_toml::ConfigToml;
@@ -144,7 +143,10 @@ impl ConfigManager {
             .map_err(|err| ConfigManagerError::json("failed to deserialize configuration", err))?;
 
         let mut origins = layers.origins();
-        origins.retain(|path, _| {
+        origins.retain(|path, metadata| {
+            if matches!(&metadata.name, ConfigLayerSource::PackagedDefaults { .. }) {
+                return false;
+            }
             let segments = path.split('.').map(str::to_string).collect::<Vec<_>>();
             layers
                 .requirements_toml()
@@ -160,11 +162,10 @@ impl ConfigManager {
                 .collect(),
             layers: params.include_layers.then(|| {
                 layers
-                    .get_layers(
-                        ConfigLayerStackOrdering::HighestPrecedenceFirst,
-                        /*include_disabled*/ true,
-                    )
-                    .iter()
+                    .all_layers_high_to_low()
+                    .filter(|layer| {
+                        !matches!(&layer.name, ConfigLayerSource::PackagedDefaults { .. })
+                    })
                     .map(|layer| config_layer_to_api(layer.as_layer()))
                     .collect()
             }),
@@ -786,6 +787,9 @@ fn value_at_semantic_path<'a>(root: &'a TomlValue, segments: &[String]) -> Optio
 
 fn override_message(layer: &ConfigLayerSource) -> String {
     match layer {
+        ConfigLayerSource::PackagedDefaults { file } => {
+            format!("Overridden by packaged defaults: {}", file.display())
+        }
         ConfigLayerSource::Mdm { domain, key: _ } => {
             format!("Overridden by managed policy (MDM): {domain}")
         }
@@ -820,10 +824,8 @@ fn compute_override_metadata(
     effective: &TomlValue,
     segments: &[String],
 ) -> Option<OverriddenMetadata> {
-    let user_value = match layers.get_active_user_layer() {
-        Some(user_layer) => value_at_semantic_path(&user_layer.config, segments),
-        None => return None,
-    };
+    let user_layer = layers.get_active_user_layer()?;
+    let user_value = value_at_semantic_path(&user_layer.config, segments);
     let effective_value = value_at_semantic_path(effective, segments);
 
     if user_value.is_some() && user_value == effective_value {
@@ -835,6 +837,9 @@ fn compute_override_metadata(
     }
 
     let overriding_layer = find_effective_layer(layers, segments)?;
+    if overriding_layer.name.precedence() <= user_layer.name.precedence() {
+        return None;
+    }
     let message = override_message(&overriding_layer.name);
 
     Some(OverriddenMetadata {

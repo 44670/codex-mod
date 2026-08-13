@@ -4,6 +4,7 @@ use anyhow::Context;
 use anyhow::Result;
 use codex_config::types::ApprovalsReviewer;
 use codex_core::CodexThread;
+use codex_core::TurnInputRequest;
 use codex_core::config::Constrained;
 use codex_core::config::ThreadStoreConfig;
 use codex_core::sandboxing::SandboxPermissions;
@@ -12,6 +13,9 @@ use codex_models_manager::bundled_models_response;
 use codex_protocol::approvals::NetworkApprovalProtocol;
 use codex_protocol::approvals::NetworkPolicyAmendment;
 use codex_protocol::approvals::NetworkPolicyRuleAction;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemAccessMode;
@@ -28,6 +32,7 @@ use codex_protocol::protocol::GranularApprovalConfig;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::SandboxPolicy;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use core_test_support::managed_network_requirements_loader;
 use core_test_support::responses::ev_apply_patch_custom_tool_call;
@@ -658,30 +663,27 @@ async fn submit_turn(
     let session_model = test.session_configured.model.clone();
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: prompt.into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(local_selections(test.config.cwd.clone())),
                 approval_policy: Some(approval_policy),
                 approvals_reviewer: Some(ApprovalsReviewer::User),
                 sandbox_policy: Some(sandbox_policy),
-                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                    mode: codex_protocol::config_types::ModeKind::Default,
-                    settings: codex_protocol::config_types::Settings {
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
                         model: session_model,
                         reasoning_effort: None,
                         developer_instructions: None,
                     },
                 }),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
 
     Ok(())
@@ -695,29 +697,26 @@ async fn submit_turn_preserving_active_permission_profile(
     let session_model = test.session_configured.model.clone();
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: prompt.into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(local_selections(test.config.cwd.clone())),
                 approval_policy: Some(approval_policy),
                 approvals_reviewer: Some(ApprovalsReviewer::User),
-                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                    mode: codex_protocol::config_types::ModeKind::Default,
-                    settings: codex_protocol::config_types::Settings {
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
                         model: session_model,
                         reasoning_effort: None,
                         developer_instructions: None,
                     },
                 }),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
 
     Ok(())
@@ -2141,6 +2140,127 @@ async fn approving_apply_patch_for_session_skips_future_prompts_for_same_file() 
 
 #[tokio::test(flavor = "current_thread")]
 #[cfg(unix)]
+async fn approving_execpolicy_amendment_does_not_reinject_permissions_instructions() -> Result<()> {
+    assert_execpolicy_amendment_context(PermissionsInstructionsExpectation::Included).await
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[cfg(unix)]
+async fn approving_execpolicy_amendment_is_reported_when_permissions_are_disabled() -> Result<()> {
+    assert_execpolicy_amendment_context(PermissionsInstructionsExpectation::Omitted).await
+}
+
+#[derive(Clone, Copy)]
+enum PermissionsInstructionsExpectation {
+    Included,
+    Omitted,
+}
+
+async fn assert_execpolicy_amendment_context(
+    expectation: PermissionsInstructionsExpectation,
+) -> Result<()> {
+    let (include_permissions_instructions, expected_permissions_block_count) = match expectation {
+        PermissionsInstructionsExpectation::Included => (true, 1),
+        PermissionsInstructionsExpectation::Omitted => (false, 0),
+    };
+    let server = start_mock_server().await;
+    let approval_policy = AskForApproval::OnRequest;
+    let sandbox_policy = SandboxPolicy::new_read_only_policy();
+    let sandbox_policy_for_config = sandbox_policy.clone();
+    let mut builder = test_codex()
+        .with_model_info_override("gpt-5.4", |model_info| {
+            model_info.model_messages = None;
+        })
+        .with_config(move |config| {
+            config.include_permissions_instructions = include_permissions_instructions;
+            config.permissions.approval_policy = Constrained::allow_any(approval_policy);
+            config
+                .features
+                .disable(Feature::DeferredExecutor)
+                .expect("test config should allow feature update");
+            config
+                .set_legacy_sandbox_policy(sandbox_policy_for_config)
+                .expect("set sandbox policy");
+        });
+    let test = builder.build(&server).await?;
+
+    let call_id = "permissions-prefix";
+    let (event, expected_command) = ActionKind::RunCommand {
+        command: "touch permissions-prefix.txt",
+    }
+    .prepare(
+        &test,
+        &server,
+        call_id,
+        SandboxPermissions::RequireEscalated,
+    )
+    .await?;
+    let expected_command =
+        expected_command.expect("execpolicy amendment scenario should produce a shell command");
+    let expected_execpolicy_amendment = ExecPolicyAmendment::new(vec![
+        "touch".to_string(),
+        "permissions-prefix.txt".to_string(),
+    ]);
+
+    let _ = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-permissions-prefix-1"),
+            event,
+            ev_completed("resp-permissions-prefix-1"),
+        ]),
+    )
+    .await;
+    let follow_up = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-permissions-prefix", "done"),
+            ev_completed("resp-permissions-prefix-2"),
+        ]),
+    )
+    .await;
+
+    submit_turn(&test, "permissions-prefix", approval_policy, sandbox_policy).await?;
+
+    let approval = expect_exec_approval(&test, expected_command.as_str()).await;
+    assert_eq!(
+        approval.proposed_execpolicy_amendment,
+        Some(expected_execpolicy_amendment.clone())
+    );
+    test.codex
+        .submit(Op::ExecApproval {
+            id: approval.effective_approval_id(),
+            turn_id: None,
+            decision: ReviewDecision::ApprovedExecpolicyAmendment {
+                proposed_execpolicy_amendment: expected_execpolicy_amendment,
+            },
+        })
+        .await?;
+    wait_for_completion(&test).await;
+
+    let developer_messages = follow_up.single_request().message_input_texts("developer");
+    let permissions_block_count = developer_messages
+        .iter()
+        .map(|message| message.matches("<permissions instructions>").count())
+        .sum::<usize>();
+    assert_eq!(
+        permissions_block_count, expected_permissions_block_count,
+        "saving an execpolicy amendment must respect the full permissions rendering mode: \
+         {developer_messages:#?}"
+    );
+    assert!(
+        developer_messages
+            .iter()
+            .any(|message| message.contains("Approved command prefix saved:")
+                && message.contains(r#"["touch", "permissions-prefix.txt"]"#)),
+        "expected developer message documenting saved rule, got: {developer_messages:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[cfg(unix)]
 async fn approving_execpolicy_amendment_persists_policy_and_skips_future_prompts() -> Result<()> {
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::UnlessTrusted;
@@ -2578,31 +2698,28 @@ async fn env_zsh_script_spawned_by_python_can_request_escalation_under_zsh_fork(
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(permission_profile, test.cwd.path());
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "run nested env zsh script through python".into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(local_selections(test.config.cwd.clone())),
                 approval_policy: Some(approval_policy),
                 approvals_reviewer: Some(ApprovalsReviewer::User),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
-                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                    mode: codex_protocol::config_types::ModeKind::Default,
-                    settings: codex_protocol::config_types::Settings {
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
                         model: session_model,
                         reasoning_effort: None,
                         developer_instructions: None,
                     },
                 }),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
 
     let approval_event = wait_for_event_with_timeout(
@@ -2722,31 +2839,28 @@ async fn matched_prefix_rule_runs_unsandboxed_under_zsh_fork() -> Result<()> {
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(permission_profile, test.cwd.path());
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "run allowed touch under zsh fork".into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(local_selections(test.config.cwd.clone())),
                 approval_policy: Some(approval_policy),
                 approvals_reviewer: Some(ApprovalsReviewer::User),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
-                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                    mode: codex_protocol::config_types::ModeKind::Default,
-                    settings: codex_protocol::config_types::Settings {
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
                         model: session_model,
                         reasoning_effort: None,
                         developer_instructions: None,
                     },
                 }),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
 
     wait_for_completion_without_approval(&test).await;
@@ -3639,31 +3753,28 @@ allow_local_binding = true
         turn_permission_fields(permission_profile, test.config.cwd.as_path());
     let session_model = test.session_configured.model.clone();
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "deny-read network retry".into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(local_selections(test.config.cwd.clone())),
                 approval_policy: Some(approval_policy),
                 approvals_reviewer: Some(ApprovalsReviewer::User),
                 sandbox_policy: Some(turn_sandbox_policy),
                 permission_profile: turn_permission_profile,
-                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                    mode: codex_protocol::config_types::ModeKind::Default,
-                    settings: codex_protocol::config_types::Settings {
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
                         model: session_model,
                         reasoning_effort: None,
                         developer_instructions: None,
                     },
                 }),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);

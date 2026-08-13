@@ -12,7 +12,9 @@ use codex_login::CodexAuth;
 use codex_rmcp_client::McpAuthState;
 use codex_rmcp_client::OAuthDiscoveryTimeout;
 use codex_rmcp_client::OAuthProviderError;
+use codex_rmcp_client::StreamableHttpRedirectMode;
 use codex_rmcp_client::determine_streamable_http_auth_status;
+use codex_rmcp_client::determine_streamable_http_auth_status_from_credentials;
 use codex_rmcp_client::discover_streamable_http_oauth;
 use futures::FutureExt;
 use futures::future::join_all;
@@ -61,6 +63,7 @@ pub async fn oauth_login_support(
     transport: &McpServerTransportConfig,
     http_client: Arc<dyn HttpClient>,
     discovery_timeout: OAuthDiscoveryTimeout,
+    redirect_mode: StreamableHttpRedirectMode,
 ) -> McpOAuthLoginSupport {
     let Some(mut config) = oauth_login_candidate(transport) else {
         return McpOAuthLoginSupport::Unsupported;
@@ -71,6 +74,7 @@ pub async fn oauth_login_support(
         config.env_http_headers.clone(),
         http_client,
         discovery_timeout,
+        redirect_mode,
     )
     .await
     {
@@ -89,6 +93,7 @@ fn oauth_login_candidate(transport: &McpServerTransportConfig) -> Option<McpOAut
         bearer_token_env_var,
         http_headers,
         env_http_headers,
+        ..
     } = transport
     else {
         return None;
@@ -108,8 +113,9 @@ pub async fn discover_supported_scopes(
     transport: &McpServerTransportConfig,
     http_client: Arc<dyn HttpClient>,
     discovery_timeout: OAuthDiscoveryTimeout,
+    redirect_mode: StreamableHttpRedirectMode,
 ) -> Option<Vec<String>> {
-    match oauth_login_support(transport, http_client, discovery_timeout).await {
+    match oauth_login_support(transport, http_client, discovery_timeout, redirect_mode).await {
         McpOAuthLoginSupport::Supported(config) => config.discovered_scopes,
         McpOAuthLoginSupport::Unsupported | McpOAuthLoginSupport::Unknown(_) => None,
     }
@@ -166,6 +172,11 @@ where
 {
     let futures = servers.into_iter().map(|(name, server)| {
         let name = name.clone();
+        let redirect_mode = if server.is_agent_plugin() {
+            StreamableHttpRedirectMode::AgentPluginV1
+        } else {
+            StreamableHttpRedirectMode::Legacy
+        };
         let config = server.config().clone();
         let runtime_context = runtime_context.clone();
         let has_runtime_auth = matches!(&config.auth, McpServerAuth::ChatGpt)
@@ -185,6 +196,7 @@ where
                 keyring_backend_kind,
                 has_runtime_auth,
                 &runtime_context,
+                redirect_mode,
             )
             .await
             {
@@ -212,6 +224,7 @@ async fn compute_auth_status(
     keyring_backend_kind: AuthKeyringBackendKind,
     has_runtime_auth: bool,
     runtime_context: &McpRuntimeContext,
+    redirect_mode: StreamableHttpRedirectMode,
 ) -> Result<McpAuthState> {
     if !config.enabled {
         return Ok(McpAuthState::Unsupported);
@@ -236,7 +249,22 @@ async fn compute_auth_status(
             bearer_token_env_var,
             http_headers,
             env_http_headers,
+            http_headers_helper,
         } => {
+            if http_headers_helper.is_some() {
+                // Status inspection must not execute an arbitrary local helper. Existing
+                // credentials remain reportable; otherwise discovery waits for startup/login.
+                return Ok(determine_streamable_http_auth_status_from_credentials(
+                    config.oauth_credential_name(server_name).as_ref(),
+                    url,
+                    bearer_token_env_var.as_deref(),
+                    http_headers.clone(),
+                    env_http_headers.clone(),
+                    store_mode,
+                    keyring_backend_kind,
+                )?
+                .unwrap_or(McpAuthState::Unknown));
+            }
             let http_client = runtime_context
                 .resolve_http_client(server_name, config)
                 .map_err(anyhow::Error::msg)?;
@@ -256,6 +284,7 @@ async fn compute_auth_status(
                 keyring_backend_kind,
                 http_client,
                 discovery_timeout,
+                redirect_mode,
             )
             .boxed()
             .await

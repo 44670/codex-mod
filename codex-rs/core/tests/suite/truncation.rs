@@ -5,10 +5,14 @@ use anyhow::Context;
 use anyhow::Result;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
+use codex_core::TurnInputRequest;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use core_test_support::TempDirExt;
 use core_test_support::assert_regex_match;
@@ -395,6 +399,7 @@ async fn mcp_tool_call_output_exceeds_limit_truncated_for_model() -> Result<()> 
                 enabled: true,
                 required: false,
                 supports_parallel_tool_calls: false,
+                omit_tools_from: None,
                 disabled_reason: None,
                 startup_timeout_sec: Some(std::time::Duration::from_secs(10)),
                 tool_timeout_sec: None,
@@ -497,6 +502,7 @@ async fn mcp_image_output_preserves_image_and_no_text_summary() -> Result<()> {
                 enabled: true,
                 required: false,
                 supports_parallel_tool_calls: false,
+                omit_tools_from: None,
                 disabled_reason: None,
                 startup_timeout_sec: Some(Duration::from_secs(10)),
                 tool_timeout_sec: None,
@@ -522,30 +528,27 @@ async fn mcp_image_output_preserves_image_and_no_text_summary() -> Result<()> {
 
     fixture
         .codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "call the rmcp image tool".into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(local_selections(fixture.cwd.abs())),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile: Some(permission_profile),
-                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                    mode: codex_protocol::config_types::ModeKind::Default,
-                    settings: codex_protocol::config_types::Settings {
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
                         model: session_model,
                         reasoning_effort: None,
                         developer_instructions: None,
                     },
                 }),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
 
     // Wait for completion to ensure the outbound request is captured.
@@ -787,6 +790,7 @@ async fn mcp_tool_call_output_not_truncated_with_custom_limit() -> Result<()> {
                 enabled: true,
                 required: false,
                 supports_parallel_tool_calls: false,
+                omit_tools_from: None,
                 disabled_reason: None,
                 startup_timeout_sec: Some(std::time::Duration::from_secs(10)),
                 tool_timeout_sec: None,

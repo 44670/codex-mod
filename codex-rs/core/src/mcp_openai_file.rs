@@ -13,6 +13,7 @@
 
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
+use codex_api::HostedFileUploadContext;
 use codex_api::OPENAI_FILE_UPLOAD_LIMIT_BYTES;
 use codex_api::upload_openai_file;
 use codex_http_client::RouteAwareClientPool;
@@ -20,11 +21,17 @@ use codex_login::CodexAuth;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 
+struct FileArgumentLocation<'a> {
+    field_name: &'a str,
+    index: Option<usize>,
+}
+
 pub(crate) async fn rewrite_mcp_tool_arguments_for_openai_files(
     sess: &Session,
     step_context: &StepContext,
     arguments_value: Option<JsonValue>,
     openai_file_input_optional_fields: Option<&HashMap<String, Vec<String>>>,
+    hosted_upload: Option<&HostedFileUploadContext>,
 ) -> Result<Option<JsonValue>, String> {
     let Some(openai_file_input_optional_fields) = openai_file_input_optional_fields else {
         return Ok(arguments_value);
@@ -50,6 +57,7 @@ pub(crate) async fn rewrite_mcp_tool_arguments_for_openai_files(
             field_name,
             optional_fields,
             value,
+            hosted_upload,
         )
         .await?
         else {
@@ -72,6 +80,7 @@ async fn rewrite_argument_value_for_openai_files(
     field_name: &str,
     optional_fields: &[String],
     value: &JsonValue,
+    hosted_upload: Option<&HostedFileUploadContext>,
 ) -> Result<Option<JsonValue>, String> {
     match value {
         JsonValue::String(file_path) => {
@@ -79,10 +88,13 @@ async fn rewrite_argument_value_for_openai_files(
                 step_context,
                 client_pool,
                 auth,
-                field_name,
-                /*index*/ None,
+                FileArgumentLocation {
+                    field_name,
+                    index: None,
+                },
                 optional_fields,
                 file_path,
+                hosted_upload,
             )
             .await?;
             Ok(Some(rewritten))
@@ -97,10 +109,13 @@ async fn rewrite_argument_value_for_openai_files(
                     step_context,
                     client_pool,
                     auth,
-                    field_name,
-                    Some(index),
+                    FileArgumentLocation {
+                        field_name,
+                        index: Some(index),
+                    },
                     optional_fields,
                     file_path,
+                    hosted_upload,
                 )
                 .await?;
                 rewritten_values.push(rewritten);
@@ -115,11 +130,12 @@ async fn build_uploaded_argument_value(
     step_context: &StepContext,
     client_pool: &RouteAwareClientPool,
     auth: Option<&CodexAuth>,
-    field_name: &str,
-    index: Option<usize>,
+    argument: FileArgumentLocation<'_>,
     optional_fields: &[String],
     file_path: &str,
+    hosted_upload: Option<&HostedFileUploadContext>,
 ) -> Result<JsonValue, String> {
+    let FileArgumentLocation { field_name, index } = argument;
     let contextualize_error = |error: String| match index {
         Some(index) => {
             format!("failed to upload `{file_path}` for `{field_name}[{index}]`: {error}")
@@ -184,6 +200,7 @@ async fn build_uploaded_argument_value(
         file_name,
         metadata.size,
         contents,
+        hosted_upload,
     )
     .await
     .map_err(|error| contextualize_error(error.to_string()))?;
@@ -228,7 +245,6 @@ mod tests {
 
     fn set_primary_environment_cwd(turn_context: &mut TurnContext, cwd: &Path) {
         let cwd = AbsolutePathBuf::try_from(cwd).expect("absolute path");
-        turn_context.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
         let TurnEnvironmentState::Ready(primary) = &mut turn_context.environments.environments[0]
         else {
             panic!("expected ready primary environment");
@@ -239,6 +255,7 @@ mod tests {
             PathUri::from_abs_path(&cwd),
             Vec::new(),
             primary.shell.clone(),
+            primary.config.clone(),
         );
     }
 
@@ -255,6 +272,7 @@ mod tests {
             &step_context,
             arguments.clone(),
             /*openai_file_input_optional_fields*/ None,
+            /*hosted_upload*/ None,
         )
         .await
         .expect("rewrite should succeed");
@@ -315,19 +333,21 @@ mod tests {
             .await
             .expect("write local file");
         set_primary_environment_cwd(&mut turn_context, dir.path());
-        let selection = turn_context
+        let environment = turn_context
             .environments
             .primary()
-            .expect("ready primary environment")
-            .selection();
+            .expect("ready primary environment");
+        let selection = environment.selection();
+        let environment_config = environment.config.clone();
         let environments = crate::environment_selection::ThreadEnvironments::new(
             session.services.turn_environments.environment_manager(),
             crate::shell::default_user_shell(),
+            environment_config.clone(),
             crate::shell_snapshot::ShellSnapshot::disabled(),
             Default::default(),
             /*non_blocking_snapshots*/ true,
         );
-        environments.update_selections(std::slice::from_ref(&selection));
+        environments.update_selections(std::slice::from_ref(&selection), &environment_config);
         turn_context.environments = environments.snapshot().await;
         turn_context
             .environments
@@ -351,10 +371,13 @@ mod tests {
             &step_context,
             &session.services.openai_file_upload_client_pool,
             Some(&auth),
-            "file",
-            /*index*/ None,
+            FileArgumentLocation {
+                field_name: "file",
+                index: None,
+            },
             &["mime_type".to_string(), "file_name".to_string()],
             "file_report.csv",
+            /*hosted_upload*/ None,
         )
         .await
         .expect("rewrite should upload the local file");
@@ -386,10 +409,13 @@ mod tests {
             &step_context,
             &session.services.openai_file_upload_client_pool,
             Some(&auth),
-            "file",
-            /*index*/ None,
+            FileArgumentLocation {
+                field_name: "file",
+                index: None,
+            },
             &[],
             "oversized.bin",
+            /*hosted_upload*/ None,
         )
         .await
         .expect_err("oversized file should be rejected");
@@ -463,6 +489,7 @@ mod tests {
             "file",
             &[],
             &serde_json::json!("file_report.csv"),
+            /*hosted_upload*/ None,
         )
         .await
         .expect("rewrite should succeed");
@@ -576,6 +603,7 @@ mod tests {
             "files",
             &[],
             &serde_json::json!(["one.csv", "two.csv"]),
+            /*hosted_upload*/ None,
         )
         .await
         .expect("rewrite should succeed");
@@ -609,6 +637,7 @@ mod tests {
                 "file": "/definitely/missing/file.csv",
             })),
             Some(&HashMap::from([("file".to_string(), Vec::new())])),
+            /*hosted_upload*/ None,
         )
         .await
         .expect_err("missing file should fail");

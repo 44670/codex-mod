@@ -86,8 +86,11 @@ async fn handle_spawn_agent(
             }),
         )
         .await;
-    let mut config =
-        build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
+    let mut config = build_agent_spawn_config(
+        &session.get_base_instructions().await,
+        turn.as_ref(),
+        step_context.environments.primary(),
+    )?;
     if let Some(service_tier) = args.service_tier.as_ref() {
         config.service_tier = Some(service_tier.clone());
     }
@@ -112,7 +115,11 @@ async fn handle_spawn_agent(
         args.service_tier.as_deref(),
     )
     .await?;
-    apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
+    apply_spawn_agent_runtime_overrides(
+        &mut config,
+        turn.as_ref(),
+        step_context.environments.primary(),
+    )?;
 
     let result = Box::pin(session.services.agent_control.spawn_agent_with_metadata(
         config,
@@ -129,6 +136,7 @@ async fn handle_spawn_agent(
             fork_mode: args.fork_context.then_some(SpawnAgentForkMode::FullHistory),
             parent_thread_id: Some(session.thread_id),
             parent_turn_id: Some(turn.sub_id.clone()),
+            root_turn_id: turn.turn_metadata_state.root_turn_id(),
             environments: Some(step_context.environments.to_selections()),
         },
     ))

@@ -206,12 +206,6 @@ pub(super) async fn make_chatwidget_manual_with_auth(
     let mut widget = ChatWidget::new_with_op_target(common, super::CodexOpTarget::Direct(op_tx));
     widget.transcript.active_cell = None;
     widget.transcript.active_cell_revision = 0;
-    widget.normal_placeholder_text = "Ask Codex to do anything".to_string();
-    widget.side_placeholder_text =
-        "Check recently modified functions for compatibility".to_string();
-    widget
-        .bottom_pane
-        .set_placeholder_text(widget.normal_placeholder_text.clone());
     widget.set_model(&resolved_model);
     (widget, rx, op_rx)
 }
@@ -283,7 +277,6 @@ fn test_model_info(slug: &str, priority: i32, supports_fast_mode: bool) -> Model
         "default_service_tier": null,
         "availability_nux": null,
         "upgrade": null,
-        "base_instructions": "base instructions",
         "default_reasoning_summary": "none",
         "support_verbosity": false,
         "default_verbosity": null,
@@ -719,6 +712,8 @@ pub(super) fn handle_image_generation_end(
                 status: status.into(),
                 revised_prompt,
                 result: String::new(),
+                transparent_background: None,
+                failure: None,
                 saved_path,
             }),
         }),

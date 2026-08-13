@@ -6,7 +6,7 @@ use crate::PluginLoadOutcome;
 use crate::ToolSuggestDiscoverablePlugin;
 use crate::ToolSuggestPluginDiscoveryInput;
 use crate::installed_marketplaces::marketplace_install_root;
-use crate::loader::load_plugin_skills;
+use crate::loader::load_plugin_skill_inventory;
 use crate::loader::load_plugins_from_layer_stack;
 use crate::loader::refresh_non_curated_plugin_cache;
 use crate::loader::refresh_non_curated_plugin_cache_force_reinstall;
@@ -21,6 +21,9 @@ use crate::test_support::TEST_CURATED_PLUGIN_CACHE_VERSION;
 use crate::test_support::TEST_CURATED_PLUGIN_SHA;
 use crate::test_support::load_plugins_config as load_plugins_config_input;
 use crate::test_support::test_http_client_factory;
+use crate::test_support::test_plugins_manager;
+use crate::test_support::test_plugins_manager_with_options;
+use crate::test_support::test_skill_root_loader;
 use crate::test_support::write_curated_plugin;
 use crate::test_support::write_curated_plugin_sha_with as write_curated_plugin_sha;
 use crate::test_support::write_file;
@@ -38,20 +41,18 @@ use codex_config::McpServerOAuthConfig;
 use codex_config::McpServerToolConfig;
 use codex_config::RequirementSource;
 use codex_config::RequirementsLayerEntry;
+use codex_config::SkillConfigRules;
 use codex_config::compose_requirements;
 use codex_config::types::McpServerTransportConfig;
-use codex_core_skills::PluginSkillSnapshots;
-use codex_core_skills::SkillsLoadInput;
-use codex_core_skills::SkillsService;
 use codex_login::CodexAuth;
 use codex_plugin::AppDeclaration;
 use codex_plugin::PluginId;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::protocol::HookEventName;
 use codex_protocol::protocol::Product;
-use codex_skills::SkillConfigRules;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::test_support::PathBufExt;
+use codex_utils_plugins::SkillDiscoveryMode;
 use pretty_assertions::assert_eq;
 use std::fs;
 use std::path::Path;
@@ -119,7 +120,7 @@ fn plugins_config_input_with_requirements(
 #[test]
 fn plugins_manager_tracks_auth_mode() {
     let tmp = TempDir::new().unwrap();
-    let manager = PluginsManager::new(tmp.path().to_path_buf());
+    let manager = test_plugins_manager(tmp.path().to_path_buf());
 
     assert_eq!(manager.auth_mode(), None);
     assert!(manager.set_auth_mode(Some(AuthMode::ApiKey)));
@@ -130,7 +131,7 @@ fn plugins_manager_tracks_auth_mode() {
     assert!(manager.set_auth_mode(/*auth_mode*/ None));
     assert_eq!(manager.auth_mode(), None);
 
-    let manager_with_auth = PluginsManager::new_with_options(
+    let manager_with_auth = test_plugins_manager_with_options(
         tmp.path().join("auth"),
         Some(Product::Codex),
         Some(AuthMode::Chatgpt),
@@ -150,7 +151,7 @@ fn curated_repo_sync_stays_deferred_for_remote_chatgpt_catalog() {
         "https://chatgpt.com".to_string(),
         test_http_client_factory(),
     );
-    let manager = Arc::new(PluginsManager::new_with_options(
+    let manager = Arc::new(test_plugins_manager_with_options(
         tmp.path().to_path_buf(),
         Some(Product::Codex),
         Some(AuthMode::Chatgpt),
@@ -166,7 +167,7 @@ fn curated_repo_sync_stays_deferred_for_remote_chatgpt_catalog() {
 #[test]
 fn marketplace_source_refresh_notifies_only_after_installed_cache_changes() {
     let tmp = TempDir::new().unwrap();
-    let manager = PluginsManager::new(tmp.path().to_path_buf());
+    let manager = test_plugins_manager(tmp.path().to_path_buf());
     let callback_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let callback_count_for_callback = Arc::clone(&callback_count);
     let callback: EffectivePluginsChangedCallback = Arc::new(move |_change| {
@@ -226,7 +227,7 @@ source = "git"
 url = "https://github.com/example/other.git"
 "#,
     );
-    let manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let manager = test_plugins_manager(codex_home.path().to_path_buf());
 
     let allowed_outcome = manager.plugins_for_config(&allowed).await;
     assert_eq!(allowed_outcome.plugins().len(), 1);
@@ -265,7 +266,7 @@ restrict_to_allowed_sources = true
         AbsolutePathBuf::try_from(marketplace_root.join(".agents/plugins/marketplace.json"))
             .expect("absolute marketplace path");
 
-    let err = PluginsManager::new(codex_home.path().to_path_buf())
+    let err = test_plugins_manager(codex_home.path().to_path_buf())
         .read_plugin_for_config(
             &config,
             &PluginReadRequest {
@@ -304,7 +305,7 @@ fn marketplace_policy_filters_discovered_marketplaces_by_configured_name() {
     let repo_root = AbsolutePathBuf::try_from(repo_root).expect("absolute repository root");
     let subdirectory =
         AbsolutePathBuf::try_from(subdirectory).expect("absolute input subdirectory");
-    let manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let manager = test_plugins_manager(codex_home.path().to_path_buf());
     let user_config = format!(
         r#"
 [marketplaces.company]
@@ -443,7 +444,7 @@ async fn plugin_auth_projection_hides_apps_without_chatgpt_auth() {
     write_auth_projection_plugin(codex_home.path(), "sample", /*include_app*/ true);
     write_auth_projection_plugin(codex_home.path(), "docs", /*include_app*/ false);
     let config = auth_projection_config(codex_home.path()).await;
-    let manager = PluginsManager::new_with_options(
+    let manager = test_plugins_manager_with_options(
         codex_home.path().to_path_buf(),
         Some(Product::Codex),
         Some(AuthMode::ApiKey),
@@ -471,7 +472,7 @@ async fn plugin_auth_projection_hides_matching_mcp_with_chatgpt_apps_route() {
     write_auth_projection_plugin(codex_home.path(), "sample", /*include_app*/ true);
     write_auth_projection_plugin(codex_home.path(), "docs", /*include_app*/ false);
     let config = auth_projection_config(codex_home.path()).await;
-    let manager = PluginsManager::new_with_options(
+    let manager = test_plugins_manager_with_options(
         codex_home.path().to_path_buf(),
         Some(Product::Codex),
         Some(AuthMode::Chatgpt),
@@ -512,7 +513,7 @@ async fn plugin_auth_projection_hides_dual_surface_mcp_with_agent_identity_apps_
     write_auth_projection_plugin(codex_home.path(), "sample", /*include_app*/ true);
     write_auth_projection_plugin(codex_home.path(), "docs", /*include_app*/ false);
     let config = auth_projection_config(codex_home.path()).await;
-    let manager = PluginsManager::new_with_options(
+    let manager = test_plugins_manager_with_options(
         codex_home.path().to_path_buf(),
         Some(Product::Codex),
         Some(AuthMode::AgentIdentity),
@@ -537,7 +538,7 @@ async fn plugin_auth_projection_keeps_non_conflicting_mcp_with_chatgpt_apps_rout
     write_auth_projection_app(codex_home.path(), "sample", "sample_app");
     write_auth_projection_plugin(codex_home.path(), "docs", /*include_app*/ false);
     let config = auth_projection_config(codex_home.path()).await;
-    let manager = PluginsManager::new_with_options(
+    let manager = test_plugins_manager_with_options(
         codex_home.path().to_path_buf(),
         Some(Product::Codex),
         Some(AuthMode::Chatgpt),
@@ -620,7 +621,7 @@ enabled = true
 "#,
     );
     let config = load_config(codex_home.path(), codex_home.path()).await;
-    let manager = PluginsManager::new_with_options(
+    let manager = test_plugins_manager_with_options(
         codex_home.path().to_path_buf(),
         Some(Product::Codex),
         Some(AuthMode::Chatgpt),
@@ -654,7 +655,7 @@ async fn plugin_auth_projection_reprojects_cached_plugins_when_auth_changes() {
     write_auth_projection_plugin(codex_home.path(), "sample", /*include_app*/ true);
     write_auth_projection_plugin(codex_home.path(), "docs", /*include_app*/ false);
     let config = auth_projection_config(codex_home.path()).await;
-    let manager = PluginsManager::new_with_options(
+    let manager = test_plugins_manager_with_options(
         codex_home.path().to_path_buf(),
         Some(Product::Codex),
         Some(AuthMode::Chatgpt),
@@ -675,6 +676,7 @@ async fn plugin_auth_projection_reprojects_cached_plugins_when_auth_changes() {
             PluginCapabilitySummary {
                 config_name: "docs@test".to_string(),
                 display_name: "docs".to_string(),
+                plugin_namespace: Some("docs".to_string()),
                 description: None,
                 has_skills: false,
                 mcp_server_names: vec!["docs".to_string()],
@@ -683,6 +685,7 @@ async fn plugin_auth_projection_reprojects_cached_plugins_when_auth_changes() {
             PluginCapabilitySummary {
                 config_name: "sample@test".to_string(),
                 display_name: "sample".to_string(),
+                plugin_namespace: Some("sample".to_string()),
                 description: None,
                 has_skills: false,
                 mcp_server_names: Vec::new(),
@@ -705,6 +708,7 @@ async fn plugin_auth_projection_reprojects_cached_plugins_when_auth_changes() {
             PluginCapabilitySummary {
                 config_name: "docs@test".to_string(),
                 display_name: "docs".to_string(),
+                plugin_namespace: Some("docs".to_string()),
                 description: None,
                 has_skills: false,
                 mcp_server_names: vec!["docs".to_string()],
@@ -713,6 +717,7 @@ async fn plugin_auth_projection_reprojects_cached_plugins_when_auth_changes() {
             PluginCapabilitySummary {
                 config_name: "sample@test".to_string(),
                 display_name: "sample".to_string(),
+                plugin_namespace: Some("sample".to_string()),
                 description: None,
                 has_skills: false,
                 mcp_server_names: vec!["sample".to_string()],
@@ -739,7 +744,11 @@ fn write_plugin_with_version(
         format!(r#"{{"name":"{manifest_name}"{version}}}"#),
     )
     .unwrap();
-    fs::write(plugin_root.join("skills/SKILL.md"), "skill").unwrap();
+    fs::write(
+        plugin_root.join("skills/SKILL.md"),
+        format!("---\nname: {manifest_name}-skill\ndescription: test skill\n---\n\n# Test skill\n"),
+    )
+    .unwrap();
     fs::write(plugin_root.join(".mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
 }
 
@@ -804,7 +813,7 @@ async fn load_plugins_from_config(
 ) -> PluginLoadOutcome {
     write_file(&codex_home.join(CONFIG_TOML_FILE), config_toml);
     let config = load_config(codex_home, codex_home).await;
-    PluginsManager::new_with_options(codex_home.to_path_buf(), Some(Product::Codex), auth_mode)
+    test_plugins_manager_with_options(codex_home.to_path_buf(), Some(Product::Codex), auth_mode)
         .plugins_for_config(&config)
         .await
 }
@@ -931,6 +940,7 @@ async fn load_plugins_loads_default_skills_and_mcp_servers() {
             root: AbsolutePathBuf::try_from(plugin_root.clone()).unwrap(),
             enabled: true,
             skill_roots: vec![plugin_root.join("skills").abs()],
+            skill_discovery_mode: SkillDiscoveryMode::Recursive,
             disabled_skill_paths: HashSet::new(),
             has_enabled_skills: true,
             mcp_servers: HashMap::from([(
@@ -942,11 +952,13 @@ async fn load_plugins_loads_default_skills_and_mcp_servers() {
                         bearer_token_env_var: None,
                         http_headers: None,
                         env_http_headers: None,
+                        http_headers_helper: None,
                     },
                     environment_id: "local".to_string(),
                     enabled: true,
                     required: false,
                     supports_parallel_tool_calls: false,
+                    omit_tools_from: None,
                     disabled_reason: None,
                     startup_timeout_sec: None,
                     tool_timeout_sec: None,
@@ -972,6 +984,7 @@ async fn load_plugins_loads_default_skills_and_mcp_servers() {
         &[PluginCapabilitySummary {
             config_name: "sample@test".to_string(),
             display_name: "sample".to_string(),
+            plugin_namespace: Some("sample".to_string()),
             description: Some("Plugin that includes the sample MCP server and Skills".to_string(),),
             has_skills: true,
             mcp_server_names: vec!["sample".to_string()],
@@ -979,7 +992,11 @@ async fn load_plugins_loads_default_skills_and_mcp_servers() {
         }]
     );
     assert_eq!(
-        outcome.effective_skill_roots(),
+        outcome
+            .effective_plugin_skill_roots()
+            .into_iter()
+            .map(|root| root.path)
+            .collect::<Vec<_>>(),
         vec![plugin_root.join("skills").abs()]
     );
     assert_eq!(outcome.effective_mcp_servers().len(), 1);
@@ -1034,11 +1051,13 @@ enabled = true
                     bearer_token_env_var: None,
                     http_headers: None,
                     env_http_headers: None,
+                    http_headers_helper: None,
                 },
                 environment_id: "local".to_string(),
                 enabled: true,
                 required: false,
                 supports_parallel_tool_calls: false,
+                omit_tools_from: None,
                 disabled_reason: None,
                 startup_timeout_sec: None,
                 tool_timeout_sec: None,
@@ -1161,7 +1180,7 @@ approval_mode = "approve"
     );
 
     let config = load_config(codex_home.path(), codex_home.path()).await;
-    let manager = PluginsManager::new_with_options(
+    let manager = test_plugins_manager_with_options(
         codex_home.path().to_path_buf(),
         Some(Product::Codex),
         Some(AuthMode::Chatgpt),
@@ -1204,7 +1223,7 @@ plugins = true
     );
 
     let config = load_config(codex_home.path(), codex_home.path()).await;
-    let manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let manager = test_plugins_manager(codex_home.path().to_path_buf());
     manager.write_remote_installed_plugins_cache(vec![remote_installed_linear_plugin()]);
 
     let outcome = manager.plugins_for_config(&config).await;
@@ -1215,7 +1234,7 @@ plugins = true
 async fn installed_plugin_telemetry_metadata_collects_capabilities() {
     let codex_home = TempDir::new().unwrap();
     write_cached_plugin(codex_home.path(), "test", "sample");
-    let manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let manager = test_plugins_manager(codex_home.path().to_path_buf());
     let plugin_id = PluginId::parse("sample@test").expect("plugin id should parse");
 
     let metadata = manager
@@ -1230,6 +1249,7 @@ async fn installed_plugin_telemetry_metadata_collects_capabilities() {
             capability_summary: Some(PluginCapabilitySummary {
                 config_name: "sample@test".to_string(),
                 display_name: "sample".to_string(),
+                plugin_namespace: Some("sample".to_string()),
                 description: None,
                 has_skills: true,
                 mcp_server_names: Vec::new(),
@@ -1237,6 +1257,62 @@ async fn installed_plugin_telemetry_metadata_collects_capabilities() {
             }),
         }
     );
+}
+
+#[tokio::test]
+async fn installed_agent_plugin_telemetry_metadata_uses_portable_capabilities() {
+    for (skill_path, has_skills) in [
+        ("skills/direct/SKILL.md", true),
+        ("skills/group/nested/SKILL.md", false),
+    ] {
+        let codex_home = TempDir::new().unwrap();
+        let plugin_root = codex_home
+            .path()
+            .join("plugins/cache/test/agent-plugin/local");
+        write_file(
+            &plugin_root.join("plugin.json"),
+            r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"agent.tools"}"#,
+        );
+        write_file(
+            &plugin_root.join(skill_path),
+            "---\nname: portable\ndescription: Portable skill\n---\n",
+        );
+        write_file(
+            &plugin_root.join("mcp.json"),
+            r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/mcp.schema.json","mcpServers":{"portable":{"type":"stdio","command":"echo"}}}"#,
+        );
+        write_file(
+            &plugin_root.join(".codex-plugin/plugin.json"),
+            r#"{"apps":"./.app.json"}"#,
+        );
+        write_file(
+            &plugin_root.join(".app.json"),
+            r#"{"apps":{"legacy":{"id":"connector_legacy"}}}"#,
+        );
+        let manager = test_plugins_manager(codex_home.path().to_path_buf());
+        let plugin_id = PluginId::parse("agent-plugin@test").expect("plugin id should parse");
+
+        let metadata = manager
+            .telemetry_metadata_for_installed_plugin(&plugin_id)
+            .await;
+
+        assert_eq!(
+            metadata,
+            PluginTelemetryMetadata {
+                plugin_id: Some(plugin_id),
+                remote_plugin_id: None,
+                capability_summary: Some(PluginCapabilitySummary {
+                    config_name: "agent-plugin@test".to_string(),
+                    display_name: "agent-plugin".to_string(),
+                    plugin_namespace: Some("agent.tools".to_string()),
+                    description: None,
+                    has_skills,
+                    mcp_server_names: vec!["portable".to_string()],
+                    app_connector_ids: Vec::new(),
+                }),
+            }
+        );
+    }
 }
 
 #[tokio::test]
@@ -1248,7 +1324,7 @@ async fn installed_plugin_telemetry_metadata_resolves_persisted_remote_identity(
     PluginStore::new(codex_home.path().to_path_buf())
         .write_remote_plugin_id(&plugin_id, "plugins~Plugin_linear")
         .expect("persist remote plugin id");
-    let manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let manager = test_plugins_manager(codex_home.path().to_path_buf());
 
     let metadata = manager
         .telemetry_metadata_for_installed_plugin(&plugin_id)
@@ -1262,6 +1338,7 @@ async fn installed_plugin_telemetry_metadata_resolves_persisted_remote_identity(
             capability_summary: Some(PluginCapabilitySummary {
                 config_name: "linear@openai-curated-remote".to_string(),
                 display_name: "linear".to_string(),
+                plugin_namespace: Some("linear".to_string()),
                 description: None,
                 has_skills: true,
                 mcp_server_names: Vec::new(),
@@ -1279,7 +1356,7 @@ fn plugin_telemetry_ignores_local_marketplace_sidecars() {
     PluginStore::new(codex_home.path().to_path_buf())
         .write_remote_plugin_id(&plugin_id, "plugins~Plugin_sample")
         .expect("persist remote plugin id");
-    let manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let manager = test_plugins_manager(codex_home.path().to_path_buf());
 
     assert_eq!(
         manager.telemetry_metadata_for_plugin_id(&plugin_id),
@@ -1300,7 +1377,7 @@ async fn installed_plugin_telemetry_metadata_prefers_remote_snapshot_identity() 
     PluginStore::new(codex_home.path().to_path_buf())
         .write_remote_plugin_id(&plugin_id, "plugins~Plugin_stale")
         .expect("persist remote plugin id");
-    let manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let manager = test_plugins_manager(codex_home.path().to_path_buf());
     manager.write_remote_installed_plugins_cache(vec![remote_installed_linear_plugin()]);
 
     let metadata = manager
@@ -1315,6 +1392,7 @@ async fn installed_plugin_telemetry_metadata_prefers_remote_snapshot_identity() 
             capability_summary: Some(PluginCapabilitySummary {
                 config_name: "linear@openai-curated-remote".to_string(),
                 display_name: "linear".to_string(),
+                plugin_namespace: Some("linear".to_string()),
                 description: None,
                 has_skills: true,
                 mcp_server_names: Vec::new(),
@@ -1327,7 +1405,7 @@ async fn installed_plugin_telemetry_metadata_prefers_remote_snapshot_identity() 
 #[tokio::test]
 async fn installed_plugin_telemetry_metadata_accepts_authoritative_remote_identity() {
     let codex_home = TempDir::new().unwrap();
-    let manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let manager = test_plugins_manager(codex_home.path().to_path_buf());
     let plugin_id =
         PluginId::parse("linear@openai-curated-remote").expect("plugin id should parse");
 
@@ -1348,10 +1426,11 @@ async fn installed_plugin_telemetry_metadata_accepts_authoritative_remote_identi
 #[test]
 fn capability_summary_telemetry_metadata_uses_local_identity() {
     let codex_home = TempDir::new().unwrap();
-    let manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let manager = test_plugins_manager(codex_home.path().to_path_buf());
     let summary = PluginCapabilitySummary {
         config_name: "linear@openai-curated-remote".to_string(),
         display_name: "Linear".to_string(),
+        plugin_namespace: Some("linear".to_string()),
         description: Some("Track work".to_string()),
         has_skills: true,
         mcp_server_names: vec!["linear".to_string()],
@@ -1381,10 +1460,11 @@ fn capability_summary_telemetry_metadata_resolves_persisted_remote_identity() {
     PluginStore::new(codex_home.path().to_path_buf())
         .write_remote_plugin_id(&plugin_id, "plugins~Plugin_linear")
         .expect("persist remote plugin id");
-    let manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let manager = test_plugins_manager(codex_home.path().to_path_buf());
     let summary = PluginCapabilitySummary {
         config_name: "linear@openai-curated-remote".to_string(),
         display_name: "Linear".to_string(),
+        plugin_namespace: Some("linear".to_string()),
         description: Some("Track work".to_string()),
         has_skills: true,
         mcp_server_names: vec!["linear".to_string()],
@@ -1429,7 +1509,7 @@ enabled = true
     write_cached_plugin(codex_home.path(), "openai-curated-remote", "remote-only");
 
     let config = load_config(codex_home.path(), codex_home.path()).await;
-    let manager = PluginsManager::new_with_options(
+    let manager = test_plugins_manager_with_options(
         codex_home.path().to_path_buf(),
         Some(Product::Codex),
         Some(AuthMode::Chatgpt),
@@ -1466,7 +1546,7 @@ enabled = true
     write_cached_plugin(codex_home.path(), "openai-curated-remote", "linear");
 
     let config = load_config(codex_home.path(), codex_home.path()).await;
-    let manager = PluginsManager::new_with_options(
+    let manager = test_plugins_manager_with_options(
         codex_home.path().to_path_buf(),
         Some(Product::Codex),
         Some(AuthMode::Chatgpt),
@@ -1504,7 +1584,7 @@ enabled = true
     write_cached_plugin(codex_home.path(), "openai-curated-remote", "remote-only");
 
     let config = load_config(codex_home.path(), codex_home.path()).await;
-    let manager = PluginsManager::new_with_options(
+    let manager = test_plugins_manager_with_options(
         codex_home.path().to_path_buf(),
         Some(Product::Codex),
         Some(AuthMode::Chatgpt),
@@ -1543,7 +1623,7 @@ enabled = true
     write_cached_plugin(codex_home.path(), "openai-curated-remote", "remote-only");
 
     let mut config = load_config(codex_home.path(), codex_home.path()).await;
-    let manager = PluginsManager::new_with_options(
+    let manager = test_plugins_manager_with_options(
         codex_home.path().to_path_buf(),
         Some(Product::Codex),
         Some(AuthMode::Chatgpt),
@@ -1586,7 +1666,7 @@ enabled = true
 #[tokio::test]
 async fn build_remote_installed_plugin_marketplaces_from_cache_uses_remote_metadata() {
     let codex_home = TempDir::new().unwrap();
-    let manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let manager = test_plugins_manager(codex_home.path().to_path_buf());
     let mut plugin = remote_installed_linear_plugin();
     plugin.install_policy = codex_app_server_protocol::PluginInstallPolicy::InstalledByDefault;
     plugin.auth_policy = codex_app_server_protocol::PluginAuthPolicy::OnInstall;
@@ -1663,7 +1743,7 @@ async fn build_remote_installed_plugin_marketplaces_from_cache_uses_remote_metad
 #[tokio::test]
 async fn build_remote_installed_plugin_marketplaces_from_cache_filters_by_marketplace_name() {
     let codex_home = TempDir::new().unwrap();
-    let manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let manager = test_plugins_manager(codex_home.path().to_path_buf());
     manager.write_remote_installed_plugins_cache(vec![
         remote_installed_plugin_in_marketplace(
             "workspace-linear",
@@ -1770,6 +1850,7 @@ enabled = true
         &[PluginCapabilitySummary {
             config_name: "sample@test".to_string(),
             display_name: "sample".to_string(),
+            plugin_namespace: Some("sample".to_string()),
             description: None,
             has_skills: true,
             mcp_server_names: Vec::new(),
@@ -1807,6 +1888,7 @@ async fn plugin_telemetry_metadata_uses_default_mcp_config_path() {
     let summary = plugin_capability_summary_from_root(
         &PluginId::parse("sample@test").expect("plugin id should parse"),
         &plugin_root.abs(),
+        test_skill_root_loader().as_ref(),
     )
     .await;
 
@@ -1815,6 +1897,7 @@ async fn plugin_telemetry_metadata_uses_default_mcp_config_path() {
         Some(PluginCapabilitySummary {
             config_name: "sample@test".to_string(),
             display_name: "sample".to_string(),
+            plugin_namespace: Some("sample".to_string()),
             description: None,
             has_skills: false,
             mcp_server_names: vec!["sample".to_string()],
@@ -1848,6 +1931,7 @@ async fn plugin_capability_summary_uses_manifest_mcp_server_objects() {
     let summary = plugin_capability_summary_from_root(
         &PluginId::parse("counter-sample@test").expect("plugin id should parse"),
         &plugin_root.abs(),
+        test_skill_root_loader().as_ref(),
     )
     .await;
 
@@ -1856,6 +1940,7 @@ async fn plugin_capability_summary_uses_manifest_mcp_server_objects() {
         Some(PluginCapabilitySummary {
             config_name: "counter-sample@test".to_string(),
             display_name: "counter-sample".to_string(),
+            plugin_namespace: Some("counter-sample".to_string()),
             description: None,
             has_skills: false,
             mcp_server_names: vec!["counter".to_string()],
@@ -2063,11 +2148,13 @@ async fn load_plugins_uses_manifest_configured_component_paths() {
                         bearer_token_env_var: None,
                         http_headers: None,
                         env_http_headers: None,
+                        http_headers_helper: None,
                     },
                     environment_id: "local".to_string(),
                     enabled: true,
                     required: false,
                     supports_parallel_tool_calls: false,
+                    omit_tools_from: None,
                     disabled_reason: None,
                     startup_timeout_sec: None,
                     tool_timeout_sec: None,
@@ -2149,16 +2236,20 @@ async fn install_plugin_materializes_default_command_skills() {
     );
 
     let manifest = crate::manifest::load_plugin_manifest(&result.installed_path).unwrap();
-    let resolved = load_plugin_skills(
+    let resolved = load_plugin_skill_inventory(
         &result.installed_path,
-        &result.plugin_id,
+        &PluginIdentity {
+            plugin_id: result.plugin_id.as_key(),
+            remote_plugin_id: None,
+        },
         &manifest,
+        PluginManifestFormat::Legacy,
         /*restriction_product*/ None,
-        &SkillConfigRules::default(),
         /*plugin_skill_snapshots*/ None,
-        Arc::new(Semaphore::new(MAX_CONCURRENT_ROOT_SCANS)),
+        test_skill_root_loader().as_ref(),
     )
-    .await;
+    .await
+    .resolve(&SkillConfigRules::default());
     assert_eq!(
         resolved
             .skills
@@ -2270,17 +2361,20 @@ async fn load_plugin_skills_dedupes_overlapping_manifest_roots() {
         interface: None,
     };
     let plugin_id = PluginId::parse("sample@test").expect("plugin id should parse");
-
-    let resolved = load_plugin_skills(
+    let resolved = load_plugin_skill_inventory(
         &plugin_root,
-        &plugin_id,
+        &PluginIdentity {
+            plugin_id: plugin_id.as_key(),
+            remote_plugin_id: None,
+        },
         &manifest,
+        PluginManifestFormat::Legacy,
         /*restriction_product*/ None,
-        &SkillConfigRules::default(),
         /*plugin_skill_snapshots*/ None,
-        Arc::new(Semaphore::new(MAX_CONCURRENT_ROOT_SCANS)),
+        test_skill_root_loader().as_ref(),
     )
-    .await;
+    .await
+    .resolve(&SkillConfigRules::default());
 
     let skill_paths = resolved
         .skills
@@ -2392,11 +2486,13 @@ async fn load_plugins_ignores_manifest_component_paths_without_dot_slash() {
                     bearer_token_env_var: None,
                     http_headers: None,
                     env_http_headers: None,
+                    http_headers_helper: None,
                 },
                 environment_id: "local".to_string(),
                 enabled: true,
                 required: false,
                 supports_parallel_tool_calls: false,
+                omit_tools_from: None,
                 disabled_reason: None,
                 startup_timeout_sec: None,
                 tool_timeout_sec: None,
@@ -2498,6 +2594,7 @@ async fn load_plugins_preserves_disabled_plugins_without_effective_contributions
             root: AbsolutePathBuf::try_from(plugin_root).unwrap(),
             enabled: false,
             skill_roots: Vec::new(),
+            skill_discovery_mode: SkillDiscoveryMode::Recursive,
             disabled_skill_paths: HashSet::new(),
             has_enabled_skills: false,
             mcp_servers: HashMap::new(),
@@ -2507,7 +2604,7 @@ async fn load_plugins_preserves_disabled_plugins_without_effective_contributions
             error: None,
         }]
     );
-    assert!(outcome.effective_skill_roots().is_empty());
+    assert!(outcome.effective_plugin_skill_roots().is_empty());
     assert!(outcome.effective_mcp_servers().is_empty());
 }
 
@@ -2644,11 +2741,13 @@ fn capability_index_filters_inactive_and_zero_capability_plugins() {
             bearer_token_env_var: None,
             http_headers: None,
             env_http_headers: None,
+            http_headers_helper: None,
         },
         environment_id: "local".to_string(),
         enabled: true,
         required: false,
         supports_parallel_tool_calls: false,
+        omit_tools_from: None,
         disabled_reason: None,
         startup_timeout_sec: None,
         tool_timeout_sec: None,
@@ -2674,6 +2773,7 @@ fn capability_index_filters_inactive_and_zero_capability_plugins() {
         root: AbsolutePathBuf::try_from(codex_home.path().join(dir_name)).unwrap(),
         enabled: true,
         skill_roots: Vec::new(),
+        skill_discovery_mode: SkillDiscoveryMode::Recursive,
         disabled_skill_paths: HashSet::new(),
         has_enabled_skills: false,
         mcp_servers: HashMap::new(),
@@ -2685,6 +2785,12 @@ fn capability_index_filters_inactive_and_zero_capability_plugins() {
     let summary = |config_name: &str, display_name: &str| PluginCapabilitySummary {
         config_name: config_name.to_string(),
         display_name: display_name.to_string(),
+        plugin_namespace: Some(
+            config_name
+                .split_once('@')
+                .map_or(config_name, |(name, _)| name)
+                .to_string(),
+        ),
         description: None,
         ..PluginCapabilitySummary::default()
     };
@@ -2769,7 +2875,7 @@ async fn load_plugins_returns_empty_when_feature_disabled() {
     );
 
     let config = load_config(codex_home.path(), codex_home.path()).await;
-    let outcome = PluginsManager::new(codex_home.path().to_path_buf())
+    let outcome = test_plugins_manager(codex_home.path().to_path_buf())
         .plugins_for_config(&config)
         .await;
 
@@ -2834,7 +2940,7 @@ async fn plugin_cache_ignores_unrelated_session_overrides() {
             test_http_client_factory(),
         )
     };
-    let manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let manager = test_plugins_manager(codex_home.path().to_path_buf());
 
     let first = manager
         .plugins_for_config(&config(r#"model = "first""#))
@@ -2849,7 +2955,7 @@ async fn plugin_cache_ignores_unrelated_session_overrides() {
 }
 
 #[tokio::test]
-async fn skill_snapshots_resolve_remote_plugin_identity_from_authoritative_source() {
+async fn skill_roots_resolve_remote_plugin_identity_from_authoritative_source() {
     let mut duplicate_plugin = remote_installed_plugin("sample");
     duplicate_plugin.id = "plugins~Plugin_duplicate".to_string();
 
@@ -2862,7 +2968,6 @@ async fn skill_snapshots_resolve_remote_plugin_identity_from_authoritative_sourc
         ),
     ] {
         let codex_home = TempDir::new().unwrap();
-        let codex_home_abs = codex_home.path().to_path_buf().abs();
         let plugin_root = codex_home
             .path()
             .join("plugins/cache/openai-curated-remote/sample/local");
@@ -2874,8 +2979,10 @@ async fn skill_snapshots_resolve_remote_plugin_identity_from_authoritative_sourc
             "sample/local",
             "sample",
         );
-        let skill_path = plugin_root.join("skills/SKILL.md");
-        write_file(&skill_path, "---\nname: search\ndescription: first\n---\n");
+        write_file(
+            &plugin_root.join("skills/SKILL.md"),
+            "---\nname: search\ndescription: first\n---\n",
+        );
         write_file(
             &codex_home.path().join(CONFIG_TOML_FILE),
             r#"[features]
@@ -2893,7 +3000,7 @@ enabled = true
             .write_remote_plugin_id(&plugin_id, "plugins~Plugin_persisted")
             .expect("persist remote plugin id");
         let config = load_config(codex_home.path(), codex_home.path()).await;
-        let manager = PluginsManager::new_with_options(
+        let manager = test_plugins_manager_with_options(
             codex_home.path().to_path_buf(),
             Some(Product::Codex),
             Some(AuthMode::Chatgpt),
@@ -2910,39 +3017,21 @@ enabled = true
                 .as_deref(),
             expected_remote_plugin_id
         );
-        write_file(&skill_path, "---\nname: search\ndescription: second\n---\n");
-
-        let skills_input = SkillsLoadInput::new(
-            codex_home_abs.clone(),
-            plugin_outcome.effective_plugin_skill_roots(),
-            config.config_layer_stack.clone(),
-            /*bundled_skills_enabled*/ false,
-        )
-        .with_plugin_skill_snapshots(manager.plugin_skill_snapshots_for_config(&config));
-        let skills_service =
-            SkillsService::new(codex_home_abs, /*bundled_skills_enabled*/ false);
-        let snapshot = skills_service
-            .snapshot_for_config(&skills_input, /*fs*/ None)
-            .await;
-
         assert_eq!(
-            snapshot
-                .outcome()
-                .skills
-                .iter()
-                .map(|skill| {
+            plugin_outcome
+                .effective_plugin_skill_roots()
+                .into_iter()
+                .map(|root| {
                     (
-                        skill.description.as_str(),
-                        skill.plugin_id.as_deref(),
-                        skill.remote_plugin_id.as_deref(),
+                        root.plugin_identity.plugin_id,
+                        root.plugin_identity.remote_plugin_id,
                     )
                 })
                 .collect::<Vec<_>>(),
             vec![(
-                "first",
-                Some("sample@openai-curated-remote"),
-                expected_remote_plugin_id,
-            )]
+                "sample@openai-curated-remote".to_string(),
+                expected_remote_plugin_id.map(str::to_string),
+            )],
         );
     }
 }
@@ -2950,7 +3039,7 @@ enabled = true
 #[test]
 fn loaded_plugins_cache_invalidation_rejects_stale_load_completion() {
     let codex_home = TempDir::new().unwrap();
-    let manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let manager = test_plugins_manager(codex_home.path().to_path_buf());
     let cache_key = PluginLoadCacheKey {
         configured_plugins: HashMap::new(),
         skill_config_rules: SkillConfigRules::default(),
@@ -2963,7 +3052,7 @@ fn loaded_plugins_cache_invalidation_rejects_stale_load_completion() {
         stale_generation,
         cache_key.clone(),
         Vec::new(),
-        PluginSkillSnapshots::for_plugin_load(),
+        crate::skill_snapshots::new_plugin_skill_snapshots(),
     );
 
     assert_eq!(manager.cached_loaded_plugins(&cache_key), None);
@@ -3006,7 +3095,7 @@ async fn load_plugins_rejects_invalid_plugin_keys() {
         outcome.plugins()[0].error.as_deref(),
         Some("invalid plugin key `sample`; expected <plugin>@<marketplace>")
     );
-    assert!(outcome.effective_skill_roots().is_empty());
+    assert!(outcome.effective_plugin_skill_roots().is_empty());
     assert!(outcome.effective_mcp_servers().is_empty());
 }
 
@@ -3037,7 +3126,7 @@ async fn install_plugin_updates_config_with_relative_path_and_plugin_key() {
     )
     .unwrap();
 
-    let result = PluginsManager::new(tmp.path().to_path_buf())
+    let result = test_plugins_manager(tmp.path().to_path_buf())
         .install_plugin(
             &unrestricted_config_layer_stack(),
             PluginInstallRequest {
@@ -3101,7 +3190,7 @@ path = {marketplace_root:?}
     let marketplace_path =
         AbsolutePathBuf::try_from(marketplace_root.join(".agents/plugins/marketplace.json"))
             .expect("absolute marketplace path");
-    let manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let manager = test_plugins_manager(codex_home.path().to_path_buf());
 
     let err = manager
         .install_plugin(
@@ -3153,7 +3242,7 @@ async fn install_openai_curated_plugin_uses_short_sha_cache_version() {
     write_openai_curated_marketplace(&curated_root, &["slack"]);
     write_curated_plugin_sha(tmp.path(), TEST_CURATED_PLUGIN_SHA);
 
-    let result = PluginsManager::new(tmp.path().to_path_buf())
+    let result = test_plugins_manager(tmp.path().to_path_buf())
         .install_plugin(
             &unrestricted_config_layer_stack(),
             PluginInstallRequest {
@@ -3214,7 +3303,7 @@ async fn install_plugin_uses_manifest_version_for_non_curated_plugins() {
     )
     .unwrap();
 
-    let result = PluginsManager::new(tmp.path().to_path_buf())
+    let result = test_plugins_manager(tmp.path().to_path_buf())
         .install_plugin(
             &unrestricted_config_layer_stack(),
             PluginInstallRequest {
@@ -3282,7 +3371,7 @@ async fn install_plugin_writes_marketplace_manifest_fallback_when_missing_plugin
     )
     .unwrap();
 
-    let result = PluginsManager::new(tmp.path().to_path_buf())
+    let result = test_plugins_manager(tmp.path().to_path_buf())
         .install_plugin(
             &unrestricted_config_layer_stack(),
             PluginInstallRequest {
@@ -3382,7 +3471,7 @@ async fn install_plugin_supports_git_subdir_marketplace_sources() {
     )
     .unwrap();
 
-    let result = PluginsManager::new(tmp.path().to_path_buf())
+    let result = test_plugins_manager(tmp.path().to_path_buf())
         .install_plugin(
             &unrestricted_config_layer_stack(),
             PluginInstallRequest {
@@ -3436,7 +3525,7 @@ async fn install_plugin_supports_relative_git_subdir_marketplace_sources() {
     )
     .unwrap();
 
-    let result = PluginsManager::new(tmp.path().to_path_buf())
+    let result = test_plugins_manager(tmp.path().to_path_buf())
         .install_plugin(
             &unrestricted_config_layer_stack(),
             PluginInstallRequest {
@@ -3481,7 +3570,7 @@ enabled = true
 "#,
     );
 
-    let manager = PluginsManager::new(tmp.path().to_path_buf());
+    let manager = test_plugins_manager(tmp.path().to_path_buf());
     manager
         .uninstall_plugin("sample-plugin@debug".to_string())
         .await
@@ -3553,7 +3642,7 @@ enabled = false
     );
 
     let config = load_config(tmp.path(), &repo_root).await;
-    let marketplaces = PluginsManager::new(tmp.path().to_path_buf())
+    let marketplaces = test_plugins_manager(tmp.path().to_path_buf())
         .list_marketplaces_for_config(
             &config,
             &[AbsolutePathBuf::try_from(repo_root).unwrap()],
@@ -3661,7 +3750,7 @@ enabled = true
     );
 
     let config = load_config(tmp.path(), &repo_root).await;
-    let marketplaces = PluginsManager::new(tmp.path().to_path_buf())
+    let marketplaces = test_plugins_manager(tmp.path().to_path_buf())
         .list_marketplaces_for_config(
             &config,
             &[AbsolutePathBuf::try_from(repo_root).unwrap()],
@@ -3713,7 +3802,7 @@ plugins = true
     );
 
     let config = load_config(tmp.path(), &repo_root).await;
-    let marketplaces = PluginsManager::new(tmp.path().to_path_buf())
+    let marketplaces = test_plugins_manager(tmp.path().to_path_buf())
         .list_marketplaces_for_config(
             &config,
             &[AbsolutePathBuf::try_from(repo_root).unwrap()],
@@ -3791,7 +3880,7 @@ enabled = true
     );
 
     let config = load_config(tmp.path(), &repo_root).await;
-    let err = PluginsManager::new(tmp.path().to_path_buf())
+    let err = test_plugins_manager(tmp.path().to_path_buf())
         .read_plugin_for_config(
             &config,
             &PluginReadRequest {
@@ -3854,7 +3943,7 @@ plugins = true
         .unwrap(),
     };
 
-    let chatgpt_outcome = PluginsManager::new_with_options(
+    let chatgpt_outcome = test_plugins_manager_with_options(
         tmp.path().to_path_buf(),
         Some(Product::Codex),
         Some(AuthMode::Chatgpt),
@@ -3871,7 +3960,7 @@ plugins = true
         vec![AppConnectorId("connector_sample".to_string())]
     );
 
-    let api_key_outcome = PluginsManager::new_with_options(
+    let api_key_outcome = test_plugins_manager_with_options(
         tmp.path().to_path_buf(),
         Some(Product::Codex),
         Some(AuthMode::ApiKey),
@@ -3923,7 +4012,7 @@ plugins = true
     );
 
     let config = load_config(tmp.path(), &repo_root).await;
-    let manager = PluginsManager::new(tmp.path().to_path_buf());
+    let manager = test_plugins_manager(tmp.path().to_path_buf());
     let outcome = manager
         .read_plugin_for_config(
             &config,
@@ -3981,6 +4070,96 @@ plugins = true
 }
 
 #[tokio::test]
+async fn agent_plugin_read_and_tool_suggestions_use_portable_capabilities_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_root = tmp.path().join("repo");
+    let plugin_root = repo_root.join("agent-plugin");
+    fs::create_dir_all(repo_root.join(".git")).unwrap();
+    fs::create_dir_all(repo_root.join(".agents/plugins")).unwrap();
+    write_file(
+        &repo_root.join(".agents/plugins/marketplace.json"),
+        r#"{"name":"debug","plugins":[{"name":"agent-plugin","source":"./agent-plugin"}]}"#,
+    );
+    write_file(
+        &plugin_root.join("plugin.json"),
+        r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"agent.tools"}"#,
+    );
+    write_file(
+        &plugin_root.join("skills/direct/SKILL.md"),
+        "---\nname: direct\ndescription: Direct skill\n---\n",
+    );
+    write_file(
+        &plugin_root.join("skills/group/nested/SKILL.md"),
+        "---\nname: nested\ndescription: Nested skill\n---\n",
+    );
+    write_file(
+        &plugin_root.join("mcp.json"),
+        r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/mcp.schema.json","mcpServers":{"portable":{"type":"stdio","command":"echo"}}}"#,
+    );
+    write_file(
+        &plugin_root.join(".codex-plugin/plugin.json"),
+        r#"{"apps":"./.app.json","hooks":"./hooks/hooks.json"}"#,
+    );
+    write_file(
+        &plugin_root.join(".app.json"),
+        r#"{"apps":{"legacy":{"id":"connector_legacy"}}}"#,
+    );
+    write_file(
+        &plugin_root.join("hooks/hooks.json"),
+        r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo legacy"}]}]}}"#,
+    );
+    write_file(
+        &tmp.path().join(CONFIG_TOML_FILE),
+        "[features]\nplugins = true\n",
+    );
+
+    let config = load_config(tmp.path(), &repo_root).await;
+    let manager = test_plugins_manager(tmp.path().to_path_buf());
+    let plugin = manager
+        .list_marketplaces_for_config(
+            &config,
+            &[AbsolutePathBuf::try_from(repo_root).unwrap()],
+            /*include_openai_curated*/ false,
+        )
+        .unwrap()
+        .marketplaces
+        .into_iter()
+        .find(|marketplace| marketplace.name == "debug")
+        .unwrap()
+        .plugins
+        .into_iter()
+        .find(|plugin| plugin.name == "agent-plugin")
+        .unwrap();
+    let detail = manager
+        .read_plugin_detail_for_marketplace_plugin(&config, "debug", plugin.clone())
+        .await
+        .unwrap();
+    let suggestion = manager
+        .tool_suggest_metadata_for_marketplace_plugin(
+            "debug",
+            &plugin,
+            &SkillConfigRules::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        detail
+            .skills
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["agent.tools:direct"]
+    );
+    assert_eq!(detail.mcp_server_names, vec!["portable"]);
+    assert!(detail.apps.is_empty());
+    assert!(detail.hooks.is_empty());
+    assert!(suggestion.has_skills);
+    assert_eq!(suggestion.mcp_server_names, vec!["portable"]);
+    assert!(suggestion.app_connector_ids.is_empty());
+}
+
+#[tokio::test]
 async fn read_plugin_for_config_does_not_fallback_from_invalid_plugin_manifest() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_root = tmp.path().join("repo");
@@ -4009,7 +4188,7 @@ plugins = true
     );
 
     let config = load_config(tmp.path(), &repo_root).await;
-    let err = PluginsManager::new(tmp.path().to_path_buf())
+    let err = test_plugins_manager(tmp.path().to_path_buf())
         .read_plugin_for_config(
             &config,
             &PluginReadRequest {
@@ -4074,7 +4253,7 @@ enabled = false
     );
 
     let config = load_config(tmp.path(), &repo_root).await;
-    let outcome = PluginsManager::new(tmp.path().to_path_buf())
+    let outcome = test_plugins_manager(tmp.path().to_path_buf())
         .read_plugin_for_config(
             &config,
             &PluginReadRequest {
@@ -4130,7 +4309,7 @@ plugins = true
     );
 
     let config = load_config(tmp.path(), &repo_root).await;
-    let outcome = PluginsManager::new(tmp.path().to_path_buf())
+    let outcome = test_plugins_manager(tmp.path().to_path_buf())
         .read_plugin_for_config(
             &config,
             &PluginReadRequest {
@@ -4273,7 +4452,7 @@ enabled = false
     );
 
     let config = load_config(tmp.path(), &repo_root).await;
-    let outcome = PluginsManager::new(tmp.path().to_path_buf())
+    let outcome = test_plugins_manager(tmp.path().to_path_buf())
         .read_plugin_for_config(
             &config,
             &PluginReadRequest {
@@ -4394,7 +4573,7 @@ enabled = true
     );
 
     let config = load_config(tmp.path(), &repo_root).await;
-    let marketplaces = PluginsManager::new(tmp.path().to_path_buf())
+    let marketplaces = test_plugins_manager(tmp.path().to_path_buf())
         .list_marketplaces_for_config(
             &config,
             &[AbsolutePathBuf::try_from(repo_root.clone()).unwrap()],
@@ -4500,7 +4679,7 @@ plugins = true
     .unwrap();
 
     let config = load_config(tmp.path(), tmp.path()).await;
-    let marketplaces = PluginsManager::new(tmp.path().to_path_buf())
+    let marketplaces = test_plugins_manager(tmp.path().to_path_buf())
         .list_marketplaces_for_config(&config, &[], /*include_openai_curated*/ true)
         .unwrap()
         .marketplaces;
@@ -4557,7 +4736,7 @@ plugins = true
     );
 
     let config = load_config(tmp.path(), tmp.path()).await;
-    let outcome = PluginsManager::new(tmp.path().to_path_buf())
+    let outcome = test_plugins_manager(tmp.path().to_path_buf())
         .list_marketplaces_for_config(&config, &[], /*include_openai_curated*/ false)
         .unwrap();
 
@@ -4617,7 +4796,7 @@ plugins = true
     );
 
     let config = load_config(tmp.path(), tmp.path()).await;
-    let manager = PluginsManager::new(tmp.path().to_path_buf());
+    let manager = test_plugins_manager(tmp.path().to_path_buf());
     manager.set_auth_mode(Some(AuthMode::ApiKey));
     let marketplaces = manager
         .list_marketplaces_for_config(&config, &[], /*include_openai_curated*/ true)
@@ -4695,7 +4874,7 @@ plugins = true
 
         let mut config = load_config(tmp.path(), tmp.path()).await;
         config.model_provider_id = resolved_provider.to_string();
-        let marketplaces = PluginsManager::new(tmp.path().to_path_buf())
+        let marketplaces = test_plugins_manager(tmp.path().to_path_buf())
             .list_marketplaces_for_config(&config, &[], /*include_openai_curated*/ true)
             .unwrap()
             .marketplaces;
@@ -4726,7 +4905,7 @@ plugins = true
     write_openai_api_curated_marketplace(&curated_root, &["api-plugin"]);
 
     let config = load_config(tmp.path(), tmp.path()).await;
-    let manager = PluginsManager::new(tmp.path().to_path_buf());
+    let manager = test_plugins_manager(tmp.path().to_path_buf());
     manager.set_auth_mode(Some(AuthMode::Chatgpt));
     let marketplaces = manager
         .list_marketplaces_for_config(&config, &[], /*include_openai_curated*/ true)
@@ -4762,7 +4941,7 @@ plugins = true
     );
 
     let config = load_config(tmp.path(), tmp.path()).await;
-    let manager = PluginsManager::new(tmp.path().to_path_buf());
+    let manager = test_plugins_manager(tmp.path().to_path_buf());
     manager.set_auth_mode(Some(AuthMode::BedrockApiKey));
     let outcome = manager
         .list_marketplaces_for_config(&config, &[], /*include_openai_curated*/ true)
@@ -4819,7 +4998,7 @@ source = "/tmp/debug"
     )
     .unwrap();
     let config = load_config(tmp.path(), tmp.path()).await;
-    let marketplaces = PluginsManager::new(tmp.path().to_path_buf())
+    let marketplaces = test_plugins_manager(tmp.path().to_path_buf())
         .list_marketplaces_for_config(&config, &[], /*include_openai_curated*/ true)
         .unwrap()
         .marketplaces;
@@ -4891,7 +5070,7 @@ source = "{remote_repo_url}"
         ),
     );
 
-    let manager = PluginsManager::new(tmp.path().to_path_buf());
+    let manager = test_plugins_manager(tmp.path().to_path_buf());
     let config = load_config(tmp.path(), tmp.path()).await;
     let initial_upgrade = manager
         .upgrade_configured_marketplaces_for_config(&config, /*marketplace_name*/ None)
@@ -4992,7 +5171,7 @@ source = "/tmp/debug"
     fs::write(registry_path, "{not valid json").unwrap();
 
     let config = load_config(tmp.path(), tmp.path()).await;
-    let marketplaces = PluginsManager::new(tmp.path().to_path_buf())
+    let marketplaces = test_plugins_manager(tmp.path().to_path_buf())
         .list_marketplaces_for_config(&config, &[], /*include_openai_curated*/ true)
         .unwrap()
         .marketplaces;
@@ -5047,7 +5226,7 @@ plugins = true
     )
     .unwrap();
     let config = load_config(tmp.path(), tmp.path()).await;
-    let marketplaces = PluginsManager::new(tmp.path().to_path_buf())
+    let marketplaces = test_plugins_manager(tmp.path().to_path_buf())
         .list_marketplaces_for_config(&config, &[], /*include_openai_curated*/ true)
         .unwrap()
         .marketplaces;
@@ -5126,7 +5305,7 @@ enabled = false
     );
 
     let config = load_config(tmp.path(), &repo_a_root).await;
-    let marketplaces = PluginsManager::new(tmp.path().to_path_buf())
+    let marketplaces = test_plugins_manager(tmp.path().to_path_buf())
         .list_marketplaces_for_config(
             &config,
             &[
@@ -5245,7 +5424,7 @@ enabled = true
     );
 
     let config = load_config(tmp.path(), &repo_root).await;
-    let marketplaces = PluginsManager::new(tmp.path().to_path_buf())
+    let marketplaces = test_plugins_manager(tmp.path().to_path_buf())
         .list_marketplaces_for_config(
             &config,
             &[AbsolutePathBuf::try_from(repo_root).unwrap()],
@@ -5319,7 +5498,7 @@ plugins = true
 
     let mut config = load_config(tmp.path(), tmp.path()).await;
     config.chatgpt_base_url = format!("{}/backend-api/", server.uri());
-    let manager = PluginsManager::new_with_options(
+    let manager = test_plugins_manager_with_options(
         tmp.path().to_path_buf(),
         Some(Product::Chatgpt),
         /*auth_mode*/ None,
@@ -5356,7 +5535,7 @@ plugins = true
 
     let mut config = load_config(tmp.path(), tmp.path()).await;
     config.chatgpt_base_url = format!("{}/backend-api/", server.uri());
-    let manager = PluginsManager::new_with_options(
+    let manager = test_plugins_manager_with_options(
         tmp.path().to_path_buf(),
         /*restriction_product*/ None,
         /*auth_mode*/ None,
@@ -5394,7 +5573,7 @@ plugins = true
 
     let mut config = load_config(tmp.path(), tmp.path()).await;
     config.chatgpt_base_url = server.uri();
-    let manager = std::sync::Arc::new(PluginsManager::new(tmp.path().to_path_buf()));
+    let manager = std::sync::Arc::new(test_plugins_manager(tmp.path().to_path_buf()));
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
     let cache_key = recommended_plugins_cache_key(&config);
 
@@ -5475,7 +5654,7 @@ plugins = true
 
     let mut config = load_config(tmp.path(), tmp.path()).await;
     config.chatgpt_base_url = server.uri();
-    let manager = PluginsManager::new(tmp.path().to_path_buf());
+    let manager = test_plugins_manager(tmp.path().to_path_buf());
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
     let expected = RecommendedPluginsMode::Endpoint {
         plugins: vec![
@@ -5545,7 +5724,7 @@ plugins = true
 
     let mut config = load_config(tmp.path(), tmp.path()).await;
     config.chatgpt_base_url = server.uri();
-    let manager = PluginsManager::new(tmp.path().to_path_buf());
+    let manager = test_plugins_manager(tmp.path().to_path_buf());
     let mut installed_linear = remote_installed_plugin("linear");
     installed_linear.id = "plugin_linear".to_string();
     manager.write_remote_installed_plugins_cache(vec![installed_linear]);
@@ -5602,7 +5781,7 @@ plugins = true
 
     let mut config = load_config(tmp.path(), tmp.path()).await;
     config.chatgpt_base_url = server.uri();
-    let manager = PluginsManager::new(tmp.path().to_path_buf());
+    let manager = test_plugins_manager(tmp.path().to_path_buf());
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
     assert_eq!(
         manager
@@ -5638,7 +5817,7 @@ plugins = true
 
     let mut config = load_config(tmp.path(), tmp.path()).await;
     config.chatgpt_base_url = server.uri();
-    let manager = PluginsManager::new(tmp.path().to_path_buf());
+    let manager = test_plugins_manager(tmp.path().to_path_buf());
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
     assert_eq!(
         manager
@@ -6322,7 +6501,7 @@ async fn load_plugins_ignores_project_config_files() {
         /*plugin_skill_snapshots*/ None,
         Some(Product::Codex),
         /*remote_global_catalog_active*/ false,
-        Arc::new(Semaphore::new(MAX_CONCURRENT_ROOT_SCANS)),
+        test_skill_root_loader().as_ref(),
     )
     .await;
 
@@ -6364,7 +6543,7 @@ async fn plugin_hooks_for_layer_stack_loads_configured_plugin_hooks() {
     );
     let config = load_config(codex_home.path(), codex_home.path()).await;
 
-    let outcome = PluginsManager::new(codex_home.path().to_path_buf())
+    let outcome = test_plugins_manager(codex_home.path().to_path_buf())
         .plugin_hooks_for_layer_stack(&config.config_layer_stack, &config)
         .await;
 
@@ -6422,7 +6601,7 @@ enabled = true
         );
     }
     let config = load_config(codex_home.path(), codex_home.path()).await;
-    let manager = PluginsManager::new_with_options(
+    let manager = test_plugins_manager_with_options(
         codex_home.path().to_path_buf(),
         Some(Product::Codex),
         Some(AuthMode::Chatgpt),
@@ -6470,7 +6649,7 @@ enabled = true
 #[test]
 fn remote_installed_plugins_cache_refresh_coalesces_materializations() {
     let tmp = TempDir::new().unwrap();
-    let manager = std::sync::Arc::new(PluginsManager::new(tmp.path().to_path_buf()));
+    let manager = std::sync::Arc::new(test_plugins_manager(tmp.path().to_path_buf()));
     let materialization_callback_count =
         std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let unrelated_callback_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
