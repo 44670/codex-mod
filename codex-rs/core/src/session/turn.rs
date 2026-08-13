@@ -414,6 +414,7 @@ pub(crate) async fn run_turn(
                             text_elements: Vec::new(),
                         }],
                         /*client_id*/ None,
+                        PersistContext::Standard,
                     )
                     .await;
                 }
