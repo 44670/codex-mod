@@ -25,6 +25,7 @@ use crate::protocol::EventMsg;
 use crate::state_db;
 use codex_file_search as file_search;
 use codex_protocol::RolloutId;
+use codex_protocol::SanitizedGitUrl;
 use codex_protocol::ThreadId;
 use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::SessionMetaLine;
@@ -59,6 +60,8 @@ pub struct ThreadItem {
     pub preview: Option<String>,
     /// The user-selected section in SQLite-owned metadata.
     pub section: Option<codex_state::ThreadSection>,
+    /// Canonical project assignment in SQLite-owned metadata.
+    pub project_id: Option<String>,
     /// Working directory from session metadata.
     pub cwd: Option<PathBuf>,
     /// Git branch from session metadata.
@@ -66,7 +69,7 @@ pub struct ThreadItem {
     /// Git commit SHA from session metadata.
     pub git_sha: Option<String>,
     /// Git origin URL from session metadata.
-    pub git_origin_url: Option<String>,
+    pub git_origin_url: Option<SanitizedGitUrl>,
     /// Session source from session metadata.
     pub source: Option<SessionSource>,
     /// Persisted thread history contract selected when this thread was created.
@@ -106,7 +109,7 @@ struct HeadTailSummary {
     cwd: Option<PathBuf>,
     git_branch: Option<String>,
     git_sha: Option<String>,
-    git_origin_url: Option<String>,
+    git_origin_url: Option<SanitizedGitUrl>,
     source: Option<SessionSource>,
     history_mode: ThreadHistoryMode,
     parent_thread_id: Option<ThreadId>,
@@ -835,6 +838,7 @@ async fn build_thread_item(
             first_user_message,
             preview,
             section: None,
+            project_id: None,
             cwd,
             git_branch,
             git_sha,
@@ -1170,8 +1174,11 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
             RolloutItem::TurnContext(_) => {
                 // Not included in `head`; skip.
             }
-            RolloutItem::WorldState(_) => {
+            RolloutItem::WorldState(_) | RolloutItem::SecurityRiskScore(_) => {
                 // Not included in `head`; skip.
+            }
+            RolloutItem::RealtimeItem(_) => {
+                // Realtime presentation does not affect model-visible thread summaries.
             }
             RolloutItem::Compacted(_) => {
                 // Not included in `head`; skip.
@@ -1243,6 +1250,8 @@ pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Va
                 | RolloutItem::Compacted(_)
                 | RolloutItem::TurnContext(_)
                 | RolloutItem::WorldState(_)
+                | RolloutItem::RealtimeItem(_)
+                | RolloutItem::SecurityRiskScore(_)
                 | RolloutItem::EventMsg(_) => {}
             }
         }
@@ -1295,6 +1304,8 @@ pub async fn read_session_meta_line(path: &Path) -> io::Result<SessionMetaLine> 
             | RolloutItem::Compacted(_)
             | RolloutItem::TurnContext(_)
             | RolloutItem::WorldState(_)
+            | RolloutItem::RealtimeItem(_)
+            | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::EventMsg(_) => {}
         }
     }

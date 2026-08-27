@@ -38,6 +38,7 @@ fn resume_history(
         approvals_reviewer: None,
         sandbox_policy: config.legacy_sandbox_policy(),
         permission_profile: None,
+        active_permission_profile: None,
         network: None,
         file_system_sandbox_policy: None,
         model: previous_model.to_string(),
@@ -47,6 +48,7 @@ fn resume_history(
         multi_agent_version: None,
         multi_agent_mode: None,
         realtime_active: None,
+        cyber_access_program: None,
         effort: config.model_reasoning_effort.clone(),
         summary: config
             .model_reasoning_summary

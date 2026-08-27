@@ -33,6 +33,31 @@ const WORKSPACE_ID_ALLOWED: &str = "123e4567-e89b-42d3-a456-426614174000";
 const WORKSPACE_ID_SECOND_ALLOWED: &str = "123e4567-e89b-42d3-a456-426614174001";
 const WORKSPACE_ID_DISALLOWED: &str = "123e4567-e89b-42d3-a456-426614174002";
 
+#[test]
+fn header_auth_exposes_a_valid_chatgpt_account_id() {
+    for (account_id_header, expected_account_id) in [
+        (
+            Some(WORKSPACE_ID_ALLOWED.as_bytes()),
+            Some(WORKSPACE_ID_ALLOWED),
+        ),
+        (None, None),
+        (Some(b""), None),
+        (Some(b" account "), None),
+        (Some(&[0xff]), None),
+    ] {
+        let mut headers = http::HeaderMap::new();
+        if let Some(account_id_header) = account_id_header {
+            headers.insert(
+                "chatgpt-account-id",
+                http::HeaderValue::from_bytes(account_id_header).expect("valid header bytes"),
+            );
+        }
+
+        let auth = CodexAuth::Headers(AuthHeaders::new(headers));
+        assert_eq!(auth.get_account_id().as_deref(), expected_account_id);
+    }
+}
+
 #[tokio::test]
 async fn refresh_without_id_token() {
     let codex_home = tempdir().unwrap();
@@ -345,6 +370,7 @@ async fn stored_agent_identity_jwt_keeps_auth_json_unchanged() -> anyhow::Result
             agent_identity: Some(AgentIdentityStorage::Jwt(agent_identity.clone())),
             personal_access_token: None,
             bedrock_api_key: None,
+            bedrock_access_keys: None,
         },
         AuthCredentialsStoreMode::File,
         AuthKeyringBackendKind::Direct,
@@ -424,6 +450,7 @@ async fn login_with_access_token_writes_only_personal_access_token() {
             agent_identity: None,
             personal_access_token: Some("at-login-test".to_string()),
             bedrock_api_key: None,
+            bedrock_access_keys: None,
         }
     );
     assert_eq!(auth.resolved_mode(), AuthMode::PersonalAccessToken);
@@ -1043,6 +1070,7 @@ async fn pro_account_with_no_api_key_uses_chatgpt_auth() {
             agent_identity: None,
             personal_access_token: None,
             bedrock_api_key: None,
+            bedrock_access_keys: None,
         },
         auth_dot_json
     );
@@ -1091,6 +1119,7 @@ fn logout_removes_auth_file() -> Result<(), std::io::Error> {
         agent_identity: None,
         personal_access_token: None,
         bedrock_api_key: None,
+        bedrock_access_keys: None,
     };
     super::save_auth(
         dir.path(),
@@ -1252,6 +1281,44 @@ async fn external_bearer_only_auth_manager_returns_none_when_command_fails() {
 }
 
 #[tokio::test]
+async fn unauthorized_recovery_retries_provider_command_after_initial_failure() {
+    let script = ProviderAuthScript::new(&["provider-token"]).unwrap();
+    std::fs::write(script.tempdir.path().join("fail-once"), "").unwrap();
+    let manager = AuthManager::external_bearer_only(script.auth_config());
+    let mut recovery = manager.unauthorized_recovery();
+
+    assert_eq!(manager.auth().await, None);
+    assert_eq!(manager.auth_cached(), None);
+    assert!(recovery.has_next());
+    assert_eq!(recovery.unavailable_reason(), "ready");
+
+    let result = recovery
+        .next()
+        .await
+        .expect("external refresh should succeed");
+
+    assert_eq!(result.auth_state_changed(), Some(true));
+    assert_eq!(
+        manager.auth_cached(),
+        Some(CodexAuth::from_api_key("provider-token"))
+    );
+    assert!(!recovery.has_next());
+    assert_eq!(recovery.unavailable_reason(), "recovery_exhausted");
+    recovery.next().await.expect_err("recovery is bounded");
+}
+
+#[test]
+fn unauthorized_recovery_without_an_external_provider_still_requires_refreshable_auth() {
+    for auth in [None, Some(CodexAuth::from_api_key("static-token"))] {
+        let manager = AuthManager::from_optional_auth_for_testing(auth);
+        let recovery = manager.unauthorized_recovery();
+
+        assert!(!recovery.has_next());
+        assert_eq!(recovery.unavailable_reason(), "not_chatgpt_auth");
+    }
+}
+
+#[tokio::test]
 async fn unauthorized_recovery_uses_external_refresh_for_bearer_manager() {
     let script = ProviderAuthScript::new(&["provider-token", "refreshed-provider-token"]).unwrap();
     let mut auth_config = script.auth_config();
@@ -1292,6 +1359,36 @@ impl ExternalAuth for StaticExternalAuth {
     fn refresh(&self, _context: ExternalAuthRefreshContext) -> ExternalAuthFuture<'_, CodexAuth> {
         Box::pin(async { Ok(self.0.clone()) })
     }
+}
+
+struct RefreshingExternalAuth {
+    initial: CodexAuth,
+    refreshed: CodexAuth,
+}
+
+impl ExternalAuth for RefreshingExternalAuth {
+    fn resolve(&self) -> ExternalAuthFuture<'_, CodexAuth> {
+        Box::pin(async { Ok(self.initial.clone()) })
+    }
+
+    fn refresh(&self, _context: ExternalAuthRefreshContext) -> ExternalAuthFuture<'_, CodexAuth> {
+        Box::pin(async { Ok(self.refreshed.clone()) })
+    }
+}
+
+fn external_header_auth(account_id: Option<&'static str>) -> CodexAuth {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::AUTHORIZATION,
+        http::HeaderValue::from_static("Bearer external"),
+    );
+    if let Some(account_id) = account_id {
+        headers.insert(
+            "chatgpt-account-id",
+            http::HeaderValue::from_static(account_id),
+        );
+    }
+    CodexAuth::Headers(AuthHeaders::new(headers))
 }
 
 struct FailingExternalAuth {
@@ -1436,6 +1533,49 @@ async fn external_auth_provider_can_install_headers() {
 }
 
 #[tokio::test]
+async fn external_header_auth_obeys_workspace_policy() {
+    for (account_id, should_succeed) in [
+        (Some(WORKSPACE_ID_ALLOWED), true),
+        (Some(WORKSPACE_ID_DISALLOWED), false),
+        (None, false),
+    ] {
+        let auth = external_header_auth(account_id);
+        let expected_auth = should_succeed.then_some(auth.clone());
+        let manager = AuthManager::from_optional_auth_for_testing(/*auth*/ None);
+        manager.set_forced_chatgpt_workspace_id(Some(vec![WORKSPACE_ID_ALLOWED.to_string()]));
+
+        let result = manager
+            .set_external_auth(Arc::new(StaticExternalAuth(auth)))
+            .await;
+
+        assert_eq!(result.is_ok(), should_succeed, "account ID: {account_id:?}");
+        assert_eq!(manager.auth_cached(), expected_auth);
+    }
+}
+
+#[tokio::test]
+async fn external_header_auth_rejects_a_disallowed_workspace_on_refresh() {
+    let allowed_auth = external_header_auth(Some(WORKSPACE_ID_ALLOWED));
+    let disallowed_auth = external_header_auth(Some(WORKSPACE_ID_DISALLOWED));
+    let manager = AuthManager::from_optional_auth_for_testing(/*auth*/ None);
+    manager.set_forced_chatgpt_workspace_id(Some(vec![WORKSPACE_ID_ALLOWED.to_string()]));
+    manager
+        .set_external_auth(Arc::new(RefreshingExternalAuth {
+            initial: allowed_auth.clone(),
+            refreshed: disallowed_auth,
+        }))
+        .await
+        .expect("initial external header auth should install");
+
+    manager
+        .refresh_token_from_authority()
+        .await
+        .expect_err("external header auth from a disallowed workspace must not replace the cache");
+
+    assert_eq!(manager.auth_cached(), Some(allowed_auth));
+}
+
+#[tokio::test]
 async fn workload_identity_auth_is_immutable_and_process_local() {
     let codex_home = tempdir().expect("tempdir");
     let mut manager = AuthManager::from_auth_for_testing_with_home(
@@ -1517,6 +1657,10 @@ impl ProviderAuthScript {
             std::fs::write(
                 &script_path,
                 r#"#!/bin/sh
+if [ -f fail-once ]; then
+    rm fail-once
+    exit 1
+fi
 first_line=$(sed -n '1p' tokens.txt)
 printf '%s\n' "$first_line"
 tail -n +2 tokens.txt > tokens.next
@@ -1539,6 +1683,10 @@ mv tokens.next tokens.txt
                 &script_path,
                 r#"@echo off
 setlocal EnableExtensions DisableDelayedExpansion
+if exist fail-once (
+    del fail-once
+    exit /b 1
+)
 set "first_line="
 <tokens.txt set /p "first_line="
 if not defined first_line exit /b 1
@@ -1809,19 +1957,17 @@ fn auth_config_from_preserves_all_fields() {
 
 #[tokio::test]
 #[serial(codex_auth_env)]
-async fn try_shared_from_config_rejects_partial_workload_identity_configuration() {
+async fn shared_from_config_prefers_workload_identity_to_explicit_access_token() {
     let codex_home = tempdir().expect("tempdir");
     let config = test_auth_manager_config(codex_home.path());
-    let _access_token_guard = remove_access_token_env_var();
+    let _access_token_guard = EnvVarGuard::set(CODEX_ACCESS_TOKEN_ENV_VAR, "at-explicit");
     let _rule_guard = EnvVarGuard::set(OPENAI_FEDERATION_RULE_ID_ENV_VAR, "rule-one");
     let _assertion_file_guard = EnvVarGuard::remove(OPENAI_IDENTITY_TOKEN_FILE_ENV_VAR);
 
-    let error =
-        AuthManager::try_shared_from_config(&config, /*enable_codex_api_key_env*/ false)
-            .await
-            .expect_err("partial workload identity config should fail closed");
+    let error = AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
+        .await
+        .expect_err("partial workload identity config should fail closed");
 
-    assert!(matches!(error, RefreshTokenError::Permanent(_)));
     assert!(
         error
             .to_string()
@@ -2148,7 +2294,9 @@ async fn auth_manager_rejects_disallowed_stored_and_external_auth() {
     .await;
     config.managed_auth_policy.allowed_login_methods = Some(vec![ForcedLoginMethod::Chatgpt]);
     let manager =
-        AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false).await;
+        AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false)
+            .await
+            .expect("auth manager");
 
     assert_eq!(manager.auth().await, None);
     assert!(
@@ -2177,7 +2325,9 @@ async fn api_only_policy_rejects_access_tokens_before_hydration() {
     .await;
     config.managed_auth_policy.allowed_login_methods = Some(vec![ForcedLoginMethod::Api]);
     let manager =
-        AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false).await;
+        AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false)
+            .await
+            .expect("auth manager");
 
     assert_eq!(manager.auth().await, None);
     assert!(
@@ -2210,7 +2360,9 @@ async fn workspace_policy_rejects_agent_identity_before_hydration() {
     config.managed_auth_policy.allowed_chatgpt_workspaces =
         Some(vec![WORKSPACE_ID_ALLOWED.to_string()]);
     let manager =
-        AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false).await;
+        AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false)
+            .await
+            .expect("auth manager");
 
     assert_eq!(manager.auth().await, None);
     drop(access_token_guard);
@@ -2229,6 +2381,7 @@ async fn workspace_policy_rejects_agent_identity_before_hydration() {
                 agent_identity: Some(stored_agent_identity),
                 personal_access_token: None,
                 bedrock_api_key: None,
+                bedrock_access_keys: None,
             },
             AuthCredentialsStoreMode::File,
             AuthKeyringBackendKind::Direct,
@@ -2243,7 +2396,9 @@ async fn workspace_policy_rejects_agent_identity_before_hydration() {
         config.managed_auth_policy.allowed_chatgpt_workspaces =
             Some(vec![WORKSPACE_ID_ALLOWED.to_string()]);
         let manager =
-            AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false).await;
+            AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false)
+                .await
+                .expect("auth manager");
         assert_eq!(manager.auth().await, None);
     }
 
@@ -2279,7 +2434,9 @@ async fn workspace_policy_checks_the_selected_request_account() {
     )
     .await;
     let manager =
-        AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false).await;
+        AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false)
+            .await
+            .expect("auth manager");
 
     assert_eq!(manager.auth().await, None);
 }
@@ -2466,6 +2623,7 @@ async fn enforce_login_restrictions_logs_out_for_agent_identity_workspace_mismat
             agent_identity: Some(AgentIdentityStorage::Jwt(agent_identity)),
             personal_access_token: None,
             bedrock_api_key: None,
+            bedrock_access_keys: None,
         },
         AuthCredentialsStoreMode::File,
         AuthKeyringBackendKind::default(),

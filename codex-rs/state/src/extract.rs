@@ -26,6 +26,8 @@ pub fn apply_rollout_item(
         | RolloutItem::InterAgentCommunicationMetadata { .. } => {}
         RolloutItem::Compacted(_) => {}
         RolloutItem::WorldState(_) => {}
+        RolloutItem::SecurityRiskScore(_) => {}
+        RolloutItem::RealtimeItem(_) => {}
     }
     if metadata.model_provider.is_empty() {
         metadata.model_provider = default_provider.to_string();
@@ -52,6 +54,8 @@ pub fn rollout_item_affects_thread_metadata(item: &RolloutItem) -> bool {
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::Compacted(_)
+        | RolloutItem::RealtimeItem(_)
+        | RolloutItem::SecurityRiskScore(_)
         | RolloutItem::WorldState(_) => false,
     }
 }
@@ -390,6 +394,7 @@ mod tests {
                     forked_from_id: Some(
                         ThreadId::from_string(&Uuid::now_v7().to_string()).expect("thread id"),
                     ),
+                    forked_from_ordinal_exclusive: None,
                     parent_thread_id: None,
                     timestamp: "2026-02-26T00:00:00.000Z".to_string(),
                     cwd: PathBuf::from("/child/worktree"),
@@ -432,6 +437,7 @@ mod tests {
                 approvals_reviewer: None,
                 sandbox_policy: SandboxPolicy::DangerFullAccess,
                 permission_profile: None,
+                active_permission_profile: None,
                 network: None,
                 file_system_sandbox_policy: None,
                 model: "gpt-5".to_string(),
@@ -441,6 +447,7 @@ mod tests {
                 multi_agent_version: None,
                 multi_agent_mode: None,
                 realtime_active: None,
+                cyber_access_program: None,
                 effort: None,
                 summary: codex_protocol::config_types::ReasoningSummary::Auto,
             }),
@@ -478,6 +485,7 @@ mod tests {
                 approvals_reviewer: None,
                 sandbox_policy: SandboxPolicy::DangerFullAccess,
                 permission_profile: Some(permission_profile.clone()),
+                active_permission_profile: None,
                 network: None,
                 file_system_sandbox_policy: None,
                 model: "gpt-5".to_string(),
@@ -487,6 +495,7 @@ mod tests {
                 multi_agent_version: None,
                 multi_agent_mode: None,
                 realtime_active: None,
+                cyber_access_program: None,
                 effort: None,
                 summary: codex_protocol::config_types::ReasoningSummary::Auto,
             }),
@@ -520,6 +529,7 @@ mod tests {
                 approvals_reviewer: None,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 permission_profile: None,
+                active_permission_profile: None,
                 network: None,
                 file_system_sandbox_policy: None,
                 model: "gpt-5".to_string(),
@@ -529,6 +539,7 @@ mod tests {
                 multi_agent_version: None,
                 multi_agent_mode: None,
                 realtime_active: None,
+                cyber_access_program: None,
                 effort: Some(ReasoningEffort::High),
                 summary: codex_protocol::config_types::ReasoningSummary::Auto,
             }),
@@ -559,6 +570,7 @@ mod tests {
                 approvals_reviewer: None,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 permission_profile: None,
+                active_permission_profile: None,
                 network: None,
                 file_system_sandbox_policy: None,
                 model: "gpt-5".to_string(),
@@ -568,6 +580,7 @@ mod tests {
                 multi_agent_version: None,
                 multi_agent_mode: None,
                 realtime_active: None,
+                cyber_access_program: None,
                 effort: Some(ReasoningEffort::High),
                 summary: codex_protocol::config_types::ReasoningSummary::Auto,
             }),
@@ -639,6 +652,7 @@ mod tests {
                     session_id: thread_id.into(),
                     id: thread_id,
                     forked_from_id: None,
+                    forked_from_ordinal_exclusive: None,
                     parent_thread_id: None,
                     timestamp: "2026-02-26T00:00:00.000Z".to_string(),
                     cwd: PathBuf::from("/workspace"),
@@ -701,6 +715,7 @@ mod tests {
             section: None,
             section_position: None,
             section_entered_at: None,
+            project_id: None,
             git_sha: None,
             git_branch: None,
             git_origin_url: None,

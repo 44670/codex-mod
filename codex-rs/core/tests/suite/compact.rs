@@ -14,10 +14,13 @@ use codex_models_manager::bundled_models_response;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Settings;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ModelServiceTier;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
@@ -99,12 +102,22 @@ const REMOTE_V2_SUMMARY: &str = "global-instructions-remote-v2-summary";
 
 pub(super) const COMPACT_WARNING_MESSAGE: &str = "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.";
 
-fn ev_shell_command_call(call_id: &str, command: &str) -> serde_json::Value {
+fn ev_exec_command_call(call_id: &str, command: &str) -> serde_json::Value {
     ev_function_call(
         call_id,
-        "shell_command",
-        &json!({ "command": command }).to_string(),
+        "exec_command",
+        &json!({ "cmd": command }).to_string(),
     )
+}
+
+pub(super) fn allow_echo_commands(home: &Path) {
+    let rules_dir = home.join("rules");
+    fs::create_dir_all(&rules_dir).expect("create exec policy rules directory");
+    fs::write(
+        rules_dir.join("default.rules"),
+        r#"prefix_rule(pattern=["echo"], decision="allow")"#,
+    )
+    .expect("write echo exec policy rule");
 }
 
 fn disabled_permission_user_turn(
@@ -532,10 +545,16 @@ async fn summarize_context_three_requests_and_instructions() {
 
     // 1) Normal user input – should hit server once.
     codex
-        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-            text: "hello world".into(),
-            text_elements: Vec::new(),
-        }]))
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![
+            UserInput::Text {
+                text: "hello world".into(),
+                text_elements: Vec::new(),
+            },
+            UserInput::Text {
+                text: " second fragment".into(),
+                text_elements: Vec::new(),
+            },
+        ]))
         .await
         .unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -634,7 +653,7 @@ async fn summarize_context_three_requests_and_instructions() {
     assert!(
         messages
             .iter()
-            .any(|(r, t)| r == "user" && t == "hello world"),
+            .any(|(r, t)| r == "user" && t == "hello world second fragment"),
         "third request should include the original user message"
     );
     assert!(
@@ -654,6 +673,28 @@ async fn summarize_context_three_requests_and_instructions() {
     codex.submit(Op::Shutdown).await.unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::ShutdownComplete)).await;
 
+    let replacement_history = replacement_history_from_rollout(&rollout_path)
+        .expect("local compaction should persist replacement history");
+    let compacted_user_message = replacement_history
+        .iter()
+        .find(|item| item["content"][0]["text"] == "hello world second fragment")
+        .expect("persisted replacement history should contain the compacted user message");
+    assert_eq!(
+        json!({
+            "type": compacted_user_message["type"],
+            "role": compacted_user_message["role"],
+            "content": compacted_user_message["content"],
+            "content_item_kinds": compacted_user_message
+                ["internal_chat_message_metadata_passthrough"]["content_item_kinds"],
+        }),
+        json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello world second fragment"}],
+            "content_item_kinds": ["user.text"],
+        }),
+    );
+
     // Verify rollout contains user-turn TurnContext entries and a Compacted entry.
     println!("rollout path: {}", rollout_path.display());
     let text = std::fs::read_to_string(&rollout_path).expect("failed to read rollout file");
@@ -672,6 +713,29 @@ async fn summarize_context_three_requests_and_instructions() {
                 regular_turn_context_count += 1;
             }
             RolloutItem::Compacted(ci) if ci.message == expected_summary_message => {
+                let summary_item = ci
+                    .replacement_history
+                    .as_ref()
+                    .and_then(|history| history.last())
+                    .expect("compacted history should retain its summary");
+                let summary_item =
+                    serde_json::to_value(&summary_item.item).expect("serialize compacted summary");
+                assert_eq!(
+                    json!({
+                        "role": summary_item["role"],
+                        "content": summary_item["content"],
+                        "content_item_kinds": summary_item
+                            ["internal_chat_message_metadata_passthrough"]["content_item_kinds"],
+                    }),
+                    json!({
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": expected_summary_message,
+                        }],
+                        "content_item_kinds": ["compaction.summary"],
+                    })
+                );
                 saw_compacted_summary = true;
             }
             _ => {}
@@ -1041,14 +1105,14 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     let server = start_mock_server().await;
 
     let non_openai_provider_name = non_openai_model_provider(&server).name;
-    let codex = test_codex()
+    let test = test_codex()
+        .with_pre_build_hook(allow_echo_commands)
         .with_config(move |config| {
             config.model_provider.name = non_openai_provider_name;
         })
         .build(&server)
         .await
-        .expect("build codex")
-        .codex;
+        .expect("build codex");
 
     // user message
     let user_message = "create an app";
@@ -1078,7 +1142,7 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     // first chunk of work
     let model_reasoning_response_1_sse = sse(vec![
         reasoning_response_1.clone(),
-        ev_shell_command_call("r1-shell", "echo make-react"),
+        ev_exec_command_call("r1-shell", "echo make-react"),
         ev_completed_with_tokens("r1", token_count_used),
     ]);
 
@@ -1096,7 +1160,7 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     // second chunk of work
     let model_reasoning_response_2_sse = sse(vec![
         reasoning_response_2.clone(),
-        ev_shell_command_call("r3-shell", "echo make-node"),
+        ev_exec_command_call("r3-shell", "echo make-node"),
         ev_completed_with_tokens("r3", token_count_used),
     ]);
 
@@ -1114,7 +1178,7 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     // third chunk of work
     let model_reasoning_response_3_sse = sse(vec![
         ev_reasoning_item("m6", &["I will create a python app"], &[]),
-        ev_shell_command_call("r6-shell", "echo make-python"),
+        ev_exec_command_call("r6-shell", "echo make-python"),
         ev_completed_with_tokens("r6", token_count_used),
     ]);
 
@@ -1146,14 +1210,15 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     let request_log = mount_sse_sequence(&server, bodies).await;
 
     // Start the conversation with the user message
-    codex
-        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-            text: user_message.into(),
-            text_elements: Vec::new(),
-        }]))
+    test.codex
+        .start_or_steer_turn(disabled_permission_user_turn(
+            user_message,
+            test.cwd.path().to_path_buf(),
+            test.session_configured.model.clone(),
+        ))
         .await
         .expect("submit user input");
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     // collect the requests payloads from the model
     let requests_payloads = request_log.requests();
@@ -1308,9 +1373,9 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
         "type": "reasoning"
       },
       {
-        "arguments": "{\"command\":\"echo make-react\"}",
+        "arguments": "{\"cmd\":\"echo make-react\"}",
         "call_id": "r1-shell",
-        "name": "shell_command",
+        "name": "exec_command",
         "type": "function_call"
       },
       {
@@ -1408,9 +1473,9 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
         "type": "reasoning"
       },
       {
-        "arguments": "{\"command\":\"echo make-node\"}",
+        "arguments": "{\"cmd\":\"echo make-node\"}",
         "call_id": "r3-shell",
-        "name": "shell_command",
+        "name": "exec_command",
         "type": "function_call"
       },
       {
@@ -1508,9 +1573,9 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
         "type": "reasoning"
       },
       {
-        "arguments": "{\"command\":\"echo make-python\"}",
+        "arguments": "{\"cmd\":\"echo make-python\"}",
         "call_id": "r6-shell",
-        "name": "shell_command",
+        "name": "exec_command",
         "type": "function_call"
       },
       {
@@ -2216,6 +2281,97 @@ async fn pre_sampling_compact_runs_when_comp_hash_changes() {
         previous_model,
         next_model,
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn previous_model_compaction_resolves_selected_settings() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("m1", "before switch"),
+                ev_completed("r1"),
+            ]),
+            sse(vec![
+                ev_assistant_message("m2", "COMPACTION_SUMMARY"),
+                ev_completed("r2"),
+            ]),
+            responses::sse_completed("r3"),
+        ],
+    )
+    .await;
+    let model_provider = non_openai_model_provider(&server);
+    let test = test_codex()
+        .with_model_info_override("gpt-5.4", |model| {
+            model.comp_hash = Some("hash-a".to_string());
+            model.default_reasoning_summary = ReasoningSummary::Detailed;
+            model.service_tiers = vec![ModelServiceTier {
+                id: ServiceTier::Fast.request_value().to_string(),
+                name: "Fast".to_string(),
+                description: "Priority processing".to_string(),
+            }];
+        })
+        .with_model_info_override("gpt-5.2", |model| {
+            model.comp_hash = Some("hash-b".to_string());
+            model.default_reasoning_summary = ReasoningSummary::Auto;
+            model.service_tiers.clear();
+        })
+        .with_model("gpt-5.4")
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            config.model_reasoning_summary = None;
+            config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
+            config
+                .features
+                .enable(Feature::FastMode)
+                .expect("enable FastMode");
+            set_test_compact_prompt(config);
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    test.submit_text_turn("before switch").await?;
+    test.codex
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "after switch".to_string(),
+                text_elements: Vec::new(),
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
+                model: Some("gpt-5.2".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    // The retained priority selection is filtered out for B, restored for
+    // compaction on A, and still omitted from the following B request.
+    let actual = request_log
+        .requests()
+        .iter()
+        .map(|request| {
+            let body = request.body_json();
+            json!([
+                body["model"],
+                body["reasoning"]["summary"],
+                body["service_tier"]
+            ])
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![
+            json!(["gpt-5.4", "detailed", "priority"]),
+            json!(["gpt-5.4", "detailed", "priority"]),
+            json!(["gpt-5.2", "auto", null]),
+        ]
+    );
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

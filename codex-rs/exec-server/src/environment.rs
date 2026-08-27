@@ -9,6 +9,7 @@ use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
+use codex_protocol::shell_environment::CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN_ENV_VAR;
 
 use crate::CapabilityRootsDiscoverParams;
 use crate::CapabilityRootsDiscoverResponse;
@@ -37,20 +38,22 @@ use crate::local_file_system::LocalFileSystem;
 use crate::local_process::LocalProcess;
 use crate::process::ExecBackend;
 use crate::protocol::EnvironmentInfo;
-use crate::protocol::FsCreateDirectoryParams;
 use crate::remote::NoiseRendezvousEnvironmentConfig;
 use crate::remote_file_system::RemoteFileSystem;
 use crate::remote_process::RemoteProcess;
-use codex_utils_path_uri::PathUri;
 use tokio::sync::watch;
 use tokio_util::task::AbortOnDropHandle;
+use tracing::Instrument;
+use tracing::instrument::WithSubscriber;
+
+#[path = "environment/accepted.rs"]
+mod accepted;
 
 pub const CODEX_EXEC_SERVER_URL_ENV_VAR: &str = "CODEX_EXEC_SERVER_URL";
 pub const CODEX_EXEC_SERVER_NOISE_REGISTRY_URL_ENV_VAR: &str =
     "CODEX_EXEC_SERVER_NOISE_REGISTRY_URL";
 pub const CODEX_EXEC_SERVER_NOISE_ENVIRONMENT_ID_ENV_VAR: &str =
     "CODEX_EXEC_SERVER_NOISE_ENVIRONMENT_ID";
-pub const CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN_ENV_VAR: &str = "CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN";
 pub const CODEX_EXEC_SERVER_NOISE_CHATGPT_ACCOUNT_ID_ENV_VAR: &str =
     "CODEX_EXEC_SERVER_NOISE_CHATGPT_ACCOUNT_ID";
 
@@ -770,6 +773,13 @@ impl Environment {
         http_client_factory: HttpClientFactory,
     ) -> Self {
         let client = LazyRemoteExecServerClient::new(remote_transport, http_client_factory);
+        Self::remote_with_client(client, local_runtime_paths)
+    }
+
+    pub(crate) fn remote_with_client(
+        client: LazyRemoteExecServerClient,
+        local_runtime_paths: Option<ExecServerRuntimePaths>,
+    ) -> Self {
         let exec_backend: Arc<dyn ExecBackend> = Arc::new(RemoteProcess::new(client.clone()));
         let filesystem: Arc<dyn ExecutorFileSystem> =
             Arc::new(RemoteFileSystem::new(client.clone()));
@@ -879,9 +889,70 @@ impl Environment {
     }
 
     /// Returns environment information from the selected execution/filesystem environment.
+    /// Remote metadata is cached for the current client's lifetime.
+    #[tracing::instrument(
+        name = "exec_server.environment.info",
+        skip_all,
+        fields(remote = self.is_remote())
+    )]
     pub async fn info(&self) -> Result<EnvironmentInfo, ExecServerError> {
         match &self.remote_client {
             Some(client) => client.environment_info().await,
+            None => Ok(EnvironmentInfo::local()),
+        }
+    }
+
+    /// Refresh the connection to the executor currently registered for this environment.
+    ///
+    /// # Caller contract
+    ///
+    /// Call after a planned replacement has registered and become available under the
+    /// same environment ID. This method does not provision or destroy executors, or
+    /// wait for the registry to identify a particular replacement. It requires a remote
+    /// Noise registry-backed environment; other environment types return an error.
+    ///
+    /// # Session behavior
+    ///
+    /// A fresh registry lookup determines whether the current session can be reused.
+    /// A changed executor key, or a failed or missing session, causes a fresh connection
+    /// without resuming the old session. Retirement cancels old recovery, fails its
+    /// outstanding work and process handles, and never replays commands. The environment
+    /// object and filesystem handle remain usable through the new connection.
+    /// A matching executor key preserves a session that has not failed, including one
+    /// that is recovering; the live readiness check rejects a recovering connection.
+    ///
+    /// # Completion and errors
+    ///
+    /// Success means the selected connection answered a live status RPC, not merely that
+    /// metadata was cached. Refresh bypasses the old session's recovery deadline, but
+    /// registry lookup, connection, and status RPC timeouts still apply. If the initial
+    /// registry lookup fails, refresh leaves the old session untouched; errors after
+    /// retirement do not restore it. Ordinary disconnect recovery is unchanged unless
+    /// refresh retires the session.
+    #[tracing::instrument(
+        name = "exec_server.environment.refresh_connection",
+        skip_all,
+        fields(remote = self.is_remote())
+    )]
+    pub async fn refresh_connection(&self) -> Result<(), ExecServerError> {
+        let client = self.remote_client.as_ref().ok_or_else(|| {
+            ExecServerError::Protocol(
+                "connection refresh requires a remote environment".to_string(),
+            )
+        })?;
+        client.refresh_connection().await
+    }
+
+    /// Fetches uncached metadata, connecting or waiting for recovery as needed.
+    // TODO: Remove after app-server migrates off of force_environment_info.
+    #[tracing::instrument(
+        name = "exec_server.environment.force_info",
+        skip_all,
+        fields(remote = self.is_remote())
+    )]
+    pub async fn force_info(&self) -> Result<EnvironmentInfo, ExecServerError> {
+        match &self.remote_client {
+            Some(client) => client.get().await?.force_environment_info().await,
             None => Ok(EnvironmentInfo::local()),
         }
     }
@@ -899,26 +970,6 @@ impl Environment {
         }
     }
 
-    /// Atomically creates an owner-private directory on a remote executor.
-    pub async fn create_private_directory(&self, path: &PathUri) -> Result<(), ExecServerError> {
-        let Some(client) = &self.remote_client else {
-            return Err(ExecServerError::Protocol(
-                "private executor directory creation requires a remote environment".to_string(),
-            ));
-        };
-        client
-            .get()
-            .await?
-            .fs_create_directory(FsCreateDirectoryParams {
-                path: path.clone(),
-                recursive: Some(false),
-                sandbox: None,
-                private: Some(true),
-            })
-            .await?;
-        Ok(())
-    }
-
     /// Discovers plugin and skill manifests through the environment's high-level discovery API.
     pub async fn discover_capability_roots(
         &self,
@@ -926,22 +977,48 @@ impl Environment {
     ) -> Result<CapabilityRootsDiscoverResponse, ExecServerError> {
         match &self.remote_client {
             Some(client) => {
+                let mut connection_state = client.subscribe_connection_state();
                 let client = client.get().await?;
-                if params.roots.iter().any(|root| {
-                    root.sandbox
-                        .as_ref()
-                        .is_some_and(crate::FileSystemSandboxContext::should_run_in_sandbox)
-                }) && !client
-                    .environment_info()
-                    .await?
-                    .capabilities
-                    .capability_discovery_sandbox
-                {
-                    return Err(ExecServerError::Protocol(
-                        "exec-server does not support sandboxed capability discovery".to_string(),
-                    ));
+                let discover = || async {
+                    if params.roots.iter().any(|root| {
+                        root.sandbox
+                            .as_ref()
+                            .is_some_and(crate::FileSystemSandboxContext::should_run_in_sandbox)
+                    }) && !client
+                        .environment_info()
+                        .await?
+                        .capabilities
+                        .capability_discovery_sandbox
+                    {
+                        return Err(ExecServerError::Protocol(
+                            "exec-server does not support sandboxed capability discovery"
+                                .to_string(),
+                        ));
+                    }
+                    client.discover_capability_roots(params.clone()).await
+                };
+                match discover().await {
+                    Err(error) if crate::client::is_retryable_recovery_error(&error) => {
+                        tracing::warn!(%error, "replaying capability discovery after executor recovery");
+                        let recovered =
+                            tokio::time::timeout(std::time::Duration::from_secs(8), async {
+                                while self.readiness_result().is_none_or(|result| result.is_err()) {
+                                    if connection_state.changed().await.is_err() {
+                                        return false;
+                                    }
+                                }
+                                true
+                            })
+                            .await
+                            .unwrap_or(false);
+                        if recovered {
+                            discover().await
+                        } else {
+                            Err(error)
+                        }
+                    }
+                    response => response,
                 }
-                client.discover_capability_roots(params).await
             }
             None => crate::discover_capability_roots(self.filesystem.as_ref(), params)
                 .await
@@ -975,15 +1052,19 @@ impl Environment {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if startup_task.is_none() {
             let client = client.clone();
-            *startup_task = Some(AbortOnDropHandle::new(tokio::spawn(async move {
-                if let Err(error) = client.wait_until_ready().await {
-                    tracing::debug!(%error, "exec-server environment startup failed");
+            *startup_task = Some(AbortOnDropHandle::new(tokio::spawn(
+                async move {
+                    if let Err(error) = client.wait_until_ready().await {
+                        tracing::debug!(%error, "exec-server environment startup failed");
+                    }
                 }
-            })));
+                .in_current_span()
+                .with_current_subscriber(),
+            )));
         }
     }
 
-    /// Returns whether the initial startup attempt has completed.
+    /// Returns whether startup has completed, including a first connection made by refresh.
     pub fn startup_finished(&self) -> bool {
         self.remote_client
             .as_ref()
@@ -991,6 +1072,11 @@ impl Environment {
     }
 
     /// Waits for initial startup, retrying a previous transient failure when possible.
+    #[tracing::instrument(
+        name = "exec_server.environment.wait_until_ready",
+        skip_all,
+        fields(remote = self.is_remote())
+    )]
     pub async fn wait_until_ready(&self) -> Result<(), ExecServerError> {
         match &self.remote_client {
             Some(client) => client.wait_until_ready().await,
@@ -1717,6 +1803,7 @@ mod tests {
                     std::env::current_dir().expect("read current dir"),
                 )
                 .expect("cwd URI"),
+                shell_snapshot: None,
                 env_policy: None,
                 env: Default::default(),
                 tty: false,
@@ -1758,6 +1845,7 @@ mod tests {
                     std::env::current_dir().expect("read current dir"),
                 )
                 .expect("cwd URI"),
+                shell_snapshot: None,
                 env_policy: None,
                 env: Default::default(),
                 tty: false,
@@ -1798,7 +1886,7 @@ mod tests {
 
         let err = environment
             .get_filesystem()
-            .read_file(&path, Some(&sandbox))
+            .read_file(&path, Default::default(), Some(&sandbox))
             .await
             .expect_err("sandboxed read should require runtime paths");
 

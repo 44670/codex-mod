@@ -6,6 +6,7 @@ use crate::RolloutItem;
 use crate::RolloutLine;
 use crate::config::RolloutConfig;
 use chrono::TimeZone;
+use codex_protocol::SanitizedGitUrl;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ResponseItem;
@@ -20,8 +21,10 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::UserMessageEvent;
+use codex_protocol::security_risk::SecurityRiskScore;
 use codex_utils_absolute_path::test_support::PathExt;
 use pretty_assertions::assert_eq;
+use std::collections::BTreeMap;
 use std::fs;
 use std::fs::File;
 use std::io::Write;
@@ -63,6 +66,7 @@ fn agent_message_item(message: &str) -> RolloutItem {
         message: message.to_string(),
         phase: None,
         memory_citation: None,
+        delivery: None,
     }))
 }
 
@@ -184,6 +188,7 @@ async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
             session_id: thread_id.into(),
             id: thread_id,
             forked_from_id: None,
+            forked_from_ordinal_exclusive: None,
             parent_thread_id: None,
             timestamp: "2026-01-27T12:34:56Z".to_string(),
             cwd: home.path().to_path_buf(),
@@ -432,6 +437,62 @@ async fn load_rollout_items_preserves_legacy_guardian_assessment_lines() -> std:
 }
 
 #[tokio::test]
+async fn load_rollout_items_preserves_security_risk_scores() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let rollout_path = home.path().join("rollout.jsonl");
+    let thread_id = ThreadId::new();
+    let security_risk = SecurityRiskScore {
+        scores: BTreeMap::from([
+            ("action_risk".to_string(), 0.76),
+            ("data_exfiltration".to_string(), 0.31),
+        ]),
+        call_id: Some("call-1".to_owned()),
+        action: Some(serde_json::json!({"path": "README.md", "tool": "read_file"})),
+        sampled_at: None,
+    };
+    let security_risk_item = RolloutItem::SecurityRiskScore(security_risk.clone());
+    for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
+        assert!(crate::is_persisted_rollout_item(
+            &security_risk_item,
+            history_mode
+        ));
+    }
+
+    let mut file = File::create(&rollout_path)?;
+    for (ordinal, item) in [
+        paginated_session_meta_item(thread_id, home.path()),
+        security_risk_item,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let line = RolloutLine {
+            timestamp: "2026-07-09T00:00:00Z".to_string(),
+            ordinal: Some(ordinal as u64),
+            item,
+        };
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&line).map_err(std::io::Error::other)?
+        )?;
+    }
+
+    let (items, loaded_thread_id, parse_errors) =
+        RolloutRecorder::load_rollout_items(&rollout_path).await?;
+
+    assert_eq!(loaded_thread_id, Some(thread_id));
+    assert_eq!(parse_errors, 0);
+    assert_eq!(items.len(), 2);
+    let RolloutItem::SecurityRiskScore(persisted_security_risk) = &items[1] else {
+        panic!("expected security risk score rollout item");
+    };
+    assert_eq!(persisted_security_risk, &security_risk);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn load_rollout_items_filters_legacy_ghost_snapshots_from_compaction_history()
 -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
@@ -588,6 +649,7 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
                 message: "buffered-event".to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             },
         ))])
         .await?;
@@ -667,7 +729,7 @@ async fn referenced_paginated_rollout_starts_at_history_cutoff_and_resumes() -> 
         &config,
         RolloutRecorderParams::new(
             ThreadId::new(),
-            /*forked_from_id*/ None,
+            Some(history_base.thread_id),
             /*parent_thread_id*/ None,
             SessionSource::Exec,
             /*thread_source*/ None,
@@ -676,12 +738,19 @@ async fn referenced_paginated_rollout_starts_at_history_cutoff_and_resumes() -> 
             Vec::new(),
         )
         .with_history_mode(ThreadHistoryMode::Paginated)
-        .with_history_base(Some(history_base)),
+        .with_history_base(Some(history_base))
+        .with_forked_from_ordinal_exclusive(Some(history_base.end_ordinal_exclusive)),
     )
     .await?;
     let rollout_path = recorder.rollout_path().to_path_buf();
     recorder.persist().await?;
     recorder.shutdown().await?;
+
+    let meta = crate::read_session_meta_line(&rollout_path).await?.meta;
+    assert_eq!(
+        meta.forked_from_ordinal_exclusive,
+        Some(history_base.end_ordinal_exclusive)
+    );
 
     let resumed =
         RolloutRecorder::new(&config, RolloutRecorderParams::resume(rollout_path.clone())).await?;
@@ -835,6 +904,7 @@ async fn persist_reports_filesystem_error_and_retries_buffered_items() -> std::i
                 message: "buffered-before-persist".to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             },
         ))])
         .await?;
@@ -886,6 +956,7 @@ async fn writer_state_retries_write_error_before_reporting_flush_success() -> st
             message: "queued-after-writer-error".to_string(),
             phase: None,
             memory_citation: None,
+            delivery: None,
         },
     ))]);
 
@@ -1411,7 +1482,9 @@ async fn list_threads_metadata_filter_overlays_state_db_list_metadata() -> std::
     builder.cwd = home.path().to_path_buf();
     builder.git_branch = Some("sqlite-branch".to_string());
     builder.git_sha = Some("sqlite-sha".to_string());
-    builder.git_origin_url = Some("https://example.com/repo.git".to_string());
+    builder.git_origin_url = Some(
+        SanitizedGitUrl::try_from("https://example.com/repo.git").expect("valid git remote URL"),
+    );
     let mut metadata = builder.build(config.model_provider_id.as_str());
     metadata.first_user_message = Some("Hello from user".to_string());
     metadata.preview = metadata.first_user_message.clone();
@@ -1456,11 +1529,15 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
         thread_id: Some(filesystem_thread_id),
         first_user_message: Some("filesystem message".to_string()),
         preview: Some("filesystem preview".to_string()),
+        project_id: None,
         section: None,
         cwd: None,
         git_branch: Some("filesystem-branch".to_string()),
         git_sha: Some("filesystem-sha".to_string()),
-        git_origin_url: Some("https://example.com/filesystem.git".to_string()),
+        git_origin_url: Some(
+            SanitizedGitUrl::try_from("https://example.com/filesystem.git")
+                .expect("valid git remote URL"),
+        ),
         source: None,
         history_mode: Default::default(),
         parent_thread_id: None,
@@ -1477,6 +1554,7 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
         thread_id: Some(state_thread_id),
         first_user_message: Some("state message".to_string()),
         preview: Some("state preview".to_string()),
+        project_id: None,
         section: Some(codex_state::ThreadSection {
             id: codex_state::PINNED_THREAD_SECTION_ID.to_string(),
             name: codex_state::PINNED_THREAD_SECTION_NAME.to_string(),
@@ -1485,7 +1563,10 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
         cwd: Some(PathBuf::from("/tmp/state-cwd")),
         git_branch: Some("state-branch".to_string()),
         git_sha: Some("state-sha".to_string()),
-        git_origin_url: Some("https://example.com/state.git".to_string()),
+        git_origin_url: Some(
+            SanitizedGitUrl::try_from("https://example.com/state.git")
+                .expect("valid git remote URL"),
+        ),
         source: Some(SessionSource::Exec),
         history_mode: Default::default(),
         parent_thread_id: None,
@@ -1646,6 +1727,7 @@ async fn resume_candidate_matches_cwd_reads_latest_turn_context() -> std::io::Re
             approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             permission_profile: None,
+            active_permission_profile: None,
             network: None,
             file_system_sandbox_policy: None,
             model: "test-model".to_string(),
@@ -1655,6 +1737,7 @@ async fn resume_candidate_matches_cwd_reads_latest_turn_context() -> std::io::Re
             multi_agent_version: None,
             multi_agent_mode: None,
             realtime_active: None,
+            cyber_access_program: None,
             effort: None,
             summary: codex_protocol::config_types::ReasoningSummary::Auto,
         }),

@@ -234,7 +234,9 @@ async fn build_test_processor(
 ) {
     let (outgoing_tx, outgoing_rx) = mpsc::channel(16);
     let auth_manager =
-        AuthManager::shared_from_config(config.as_ref(), /*enable_codex_api_key_env*/ false).await;
+        AuthManager::shared_from_config(config.as_ref(), /*enable_codex_api_key_env*/ false)
+            .await
+            .expect("test auth manager");
     let config_manager = ConfigManager::new(
         config.codex_home.to_path_buf(),
         Vec::new(),
@@ -661,6 +663,8 @@ async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
                         text: "hello".to_string(),
                         text_elements: Vec::new(),
                     }],
+                    turn_trigger: None,
+                    tool_output: None,
                     responsesapi_client_metadata: None,
                     additional_context: None,
                     cwd: None,
@@ -671,12 +675,14 @@ async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
                     approvals_reviewer: None,
                     model: None,
                     service_tier: None,
+                    service_tier_for_turn: None,
                     effort: None,
                     summary: None,
                     personality: None,
                     output_schema: None,
                     collaboration_mode: None,
                     multi_agent_mode: None,
+                    cyber_access_program: None,
                 },
             },
             Some(remote_trace),

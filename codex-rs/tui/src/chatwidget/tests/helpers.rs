@@ -44,6 +44,7 @@ pub(super) fn normalize_snapshot_paths(text: impl Into<String>) -> String {
             text = text.replace(&platform_path, unix_path);
         }
     }
+    text = text.replace("/tmp/project\\", "/tmp/project/");
 
     let platform_test_cwd = test_path_display("/tmp/project");
     if platform_test_cwd == "/tmp/project" {
@@ -282,7 +283,6 @@ fn test_model_info(slug: &str, priority: i32, supports_fast_mode: bool) -> Model
         "default_verbosity": null,
         "apply_patch_tool_type": null,
         "truncation_policy": {"mode": "bytes", "limit": 10_000},
-        "supports_parallel_tool_calls": false,
         "supports_image_detail_original": false,
         "context_window": 272_000,
         "experimental_supported_tools": [],
@@ -415,6 +415,7 @@ pub(super) fn handle_error(
     chat.handle_server_notification(
         ServerNotification::Error(ErrorNotification {
             error: AppServerTurnError {
+                misalignment: None,
                 message: message.into(),
                 codex_error_info,
                 additional_details: None,
@@ -448,6 +449,7 @@ pub(super) fn handle_stream_error_with_replay(
     chat.handle_server_notification(
         ServerNotification::Error(ErrorNotification {
             error: AppServerTurnError {
+                misalignment: None,
                 message: message.into(),
                 codex_error_info: None,
                 additional_details,
@@ -715,6 +717,7 @@ pub(super) fn handle_image_generation_end(
                 transparent_background: None,
                 failure: None,
                 saved_path,
+                imagegen_request_id: None,
             }),
         }),
         /*replay_kind*/ None,
@@ -767,6 +770,7 @@ pub(super) fn replay_agent_message(
             text: text.into(),
             phase: Some(MessagePhase::FinalAnswer),
             memory_citation: None,
+            delivery: None,
         },
         "turn-1".to_string(),
         replay_kind,
@@ -919,6 +923,7 @@ pub(super) fn complete_assistant_message(
                 text: text.to_string(),
                 phase,
                 memory_citation: None,
+                delivery: None,
             },
         }),
         /*replay_kind*/ None,
@@ -1668,6 +1673,16 @@ pub(super) async fn assert_hook_events_snapshot(
         "hook start should render in the live hook cell"
     );
 
+    let mut entries = vec![codex_app_server_protocol::HookOutputEntry {
+        kind: codex_app_server_protocol::HookOutputEntryKind::Warning,
+        text: "Heads up from the hook".to_string(),
+    }];
+    if event_name != codex_app_server_protocol::HookEventName::Interrupt {
+        entries.push(codex_app_server_protocol::HookOutputEntry {
+            kind: codex_app_server_protocol::HookOutputEntryKind::Context,
+            text: "Remember the startup checklist.".to_string(),
+        });
+    }
     handle_hook_completed(
         &mut chat,
         hook_run(
@@ -1675,16 +1690,7 @@ pub(super) async fn assert_hook_events_snapshot(
             event_name,
             codex_app_server_protocol::HookRunStatus::Completed,
             status_message,
-            vec![
-                codex_app_server_protocol::HookOutputEntry {
-                    kind: codex_app_server_protocol::HookOutputEntryKind::Warning,
-                    text: "Heads up from the hook".to_string(),
-                },
-                codex_app_server_protocol::HookOutputEntry {
-                    kind: codex_app_server_protocol::HookOutputEntryKind::Context,
-                    text: "Remember the startup checklist.".to_string(),
-                },
-            ],
+            entries,
         ),
     );
 
@@ -1709,5 +1715,6 @@ fn hook_event_label(event_name: codex_app_server_protocol::HookEventName) -> &'s
         codex_app_server_protocol::HookEventName::SubagentStart => "SubagentStart",
         codex_app_server_protocol::HookEventName::SubagentStop => "SubagentStop",
         codex_app_server_protocol::HookEventName::Stop => "Stop",
+        codex_app_server_protocol::HookEventName::Interrupt => "Interrupt",
     }
 }

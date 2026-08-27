@@ -16,13 +16,13 @@ use codex_extension_api::ExtensionRegistry;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::TurnInputContext;
 use codex_extension_api::TurnInputContributor;
-use codex_extension_api::TurnInputEnvironment;
 use codex_features::Feature;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TurnEnvironmentSelection;
@@ -52,31 +52,43 @@ use serde_json::json;
 
 const PRETURN_CONTEXT_DIFF_CWD: &str = "PRETURN_CONTEXT_DIFF_CWD";
 
-struct RecordingTurnInputContributor(Arc<Mutex<Vec<TurnInputEnvironment>>>);
+struct RecordingTurnInputContributor(Arc<Mutex<Vec<RecordedTurnInputEnvironment>>>);
 
 impl TurnInputContributor for RecordingTurnInputContributor {
     fn contribute<'a>(
         &'a self,
-        input: TurnInputContext,
+        input: TurnInputContext<'a>,
         _extension_metrics: Option<Arc<dyn ExtensionMetrics>>,
         _session_store: &'a ExtensionData,
         _thread_store: &'a ExtensionData,
         _turn_store: &'a ExtensionData,
     ) -> ExtensionFuture<'a, Vec<Box<dyn ContextualUserFragment + Send>>> {
         Box::pin(async move {
-            self.0
-                .lock()
-                .expect("recorded environments lock")
-                .extend(input.environments);
+            let mut recorded_environments = self.0.lock().expect("recorded environments lock");
+            for environment in input.environments {
+                recorded_environments.push(RecordedTurnInputEnvironment {
+                    environment_id: environment.environment_id,
+                    cwd: environment.cwd,
+                    is_primary: environment.is_primary,
+                });
+            }
             Vec::new()
         })
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecordedTurnInputEnvironment {
+    environment_id: String,
+    cwd: PathUri,
+    is_primary: bool,
 }
 
 fn skills_extensions() -> Arc<ExtensionRegistry<Config>> {
     let mut extensions = ExtensionRegistryBuilder::<Config>::new();
     install(&mut extensions, |config: &Config| SkillsExtensionConfig {
         include_instructions: config.include_skill_instructions,
+        max_context_tokens: config.skill_max_context_tokens,
         bundled_skills_enabled: config.bundled_skills_enabled(),
         orchestrator_skills_enabled: config.orchestrator_skills_enabled,
         shadow_selection_enabled: config.features.enabled(Feature::SkillSearch),
@@ -173,16 +185,15 @@ async fn turn_input_contributors_receive_foreign_environment_cwds() -> Result<()
     let recorded_environments = recorded_environments
         .lock()
         .expect("recorded environments lock")
-        .iter()
-        .map(|environment| {
-            (
-                environment.environment_id.clone(),
-                environment.cwd.clone(),
-                environment.is_primary,
-            )
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(recorded_environments, vec![(environment_id, cwd, true)]);
+        .clone();
+    assert_eq!(
+        recorded_environments,
+        vec![RecordedTurnInputEnvironment {
+            environment_id,
+            cwd,
+            is_primary: true,
+        }]
+    );
 
     Ok(())
 }
@@ -211,12 +222,14 @@ async fn model_visible_environment_context_preserves_foreign_workspace_roots() -
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
+                permission_profile: Some(PermissionProfile::workspace_write()),
                 environments: Some(TurnEnvironmentSelections::new(
                     test.config.cwd.clone(),
                     vec![TurnEnvironmentSelection {
                         environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
                         cwd: PathUri::from_abs_path(&test.config.cwd),
                         workspace_roots: vec![foreign_root],
+                        config: EnvironmentConfigState::FromThread,
                     }],
                 )),
                 ..Default::default()
@@ -237,6 +250,10 @@ async fn model_visible_environment_context_preserves_foreign_workspace_roots() -
     assert!(
         environment_context.contains("<workspace_roots><root>C:\\workspace</root>"),
         "foreign workspace root should remain visible to the model: {environment_context}"
+    );
+    assert!(
+        environment_context.contains("<entry access=\"write\"><path>C:\\workspace</path>"),
+        "foreign workspace root should retain its permissions: {environment_context}"
     );
 
     Ok(())

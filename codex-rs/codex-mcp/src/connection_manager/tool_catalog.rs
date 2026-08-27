@@ -288,11 +288,11 @@ impl McpConnectionSet {
         let mut tools = Vec::with_capacity(listed_tools.len());
         let mut calls = std::collections::HashMap::with_capacity(listed_tools.len());
         for tool_info in listed_tools {
-            if !crate::tool_is_model_visible(&tool_info) {
-                continue;
-            }
+            let model_visible = crate::tool_is_model_visible(&tool_info);
             let Some(client) = clients.client(&tool_info.server_name) else {
-                tools.push(tool_info);
+                if model_visible {
+                    tools.push(tool_info);
+                }
                 continue;
             };
             let Some(call) = self.prepare_call(&tool_info, client, Arc::clone(&config), *revision)
@@ -311,7 +311,9 @@ impl McpConnectionSet {
                 ),
                 call,
             );
-            tools.push(tool_info);
+            if model_visible {
+                tools.push(tool_info);
+            }
         }
         McpBinding::new(
             Arc::clone(self),
@@ -332,7 +334,7 @@ impl McpConnectionSet {
     ) -> Option<PreparedMcpCall> {
         let server_name = &tool_info.server_name;
         let view = self.servers.get(server_name)?;
-        Some(PreparedMcpCall::new(
+        PreparedMcpCall::new(
             Arc::clone(self),
             client,
             config,
@@ -343,7 +345,7 @@ impl McpConnectionSet {
             self.plugin_id_for_mcp_server_name(server_name)
                 .map(str::to_string),
             self.is_selected_plugin_mcp_server(server_name),
-        ))
+        )
     }
 
     /// Force-refresh Codex Apps tools and publish one new exact catalog revision.

@@ -795,7 +795,14 @@ fn ps_output_multiline_snapshot() {
 
 #[test]
 fn cyber_policy_error_event_snapshot() {
-    let cell = new_cyber_policy_error_event();
+    let cell = new_cyber_policy_error_event(/*plan_type*/ None);
+    let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+    insta::assert_snapshot!(rendered);
+}
+
+#[test]
+fn cyber_policy_error_event_individual_snapshot() {
+    let cell = new_cyber_policy_error_event(Some(PlanType::Pro));
     let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
     insta::assert_snapshot!(rendered);
 }
@@ -809,7 +816,7 @@ fn safety_access_block_event_snapshot() {
 
 #[test]
 fn cyber_policy_error_event_narrow_snapshot() {
-    let cell = new_cyber_policy_error_event();
+    let cell = new_cyber_policy_error_event(/*plan_type*/ None);
     let rendered = render_lines(&cell.display_lines(/*width*/ 36)).join("\n");
     insta::assert_snapshot!(rendered);
 }
@@ -1007,6 +1014,7 @@ async fn mcp_tools_output_lists_tools_for_hyphenated_server_names() {
 fn mcp_tools_output_from_statuses_renders_status_only_servers() {
     let statuses = vec![McpServerStatus {
         name: "plugin_docs".to_string(),
+        runtime_status: None,
         plugin_id: None,
         server_info: None,
         tools: HashMap::from([(
@@ -1038,6 +1046,7 @@ fn mcp_tools_output_from_statuses_renders_status_only_servers() {
 fn mcp_tools_output_from_statuses_renders_verbose_inventory() {
     let statuses = vec![McpServerStatus {
         name: "plugin_docs".to_string(),
+        runtime_status: None,
         plugin_id: None,
         server_info: None,
         tools: HashMap::from([(
@@ -1452,6 +1461,14 @@ fn mcp_inventory_loading_without_animations_is_stable() {
 
     assert_eq!(first, second);
     assert_eq!(first, vec!["• Loading MCP inventory…".to_string()]);
+}
+
+#[test]
+fn thread_recap_loading_without_animations_snapshot() {
+    let cell = ThreadRecapLoadingCell::new(/*animations_enabled*/ false);
+    let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+
+    insta::assert_snapshot!(rendered, @"• Generating conversation recap…");
 }
 
 #[test]
@@ -2269,6 +2286,61 @@ fn user_history_cell_wraps_and_prefixes_each_line_snapshot() {
 }
 
 #[test]
+fn user_history_cell_wraps_long_urls_inside_the_message_gutter() {
+    let url = "https://example.test/forwarded/threads/10930?page=1&search=&filter=all&queue=customer_support_unprocessed&sort=latest_desc&forwardedScope=all";
+    let message = format!(
+        "Skip tests.\n\nI just reprocessed\n{url}\ncan you check where we are with it?\n\n[Image #1]"
+    );
+    let image_start = message.find("[Image #1]").unwrap();
+    let cell = UserHistoryCell {
+        message,
+        text_elements: vec![TextElement::new(
+            (image_start..image_start + "[Image #1]".len()).into(),
+            Some("[Image #1]".to_string()),
+        )],
+        local_image_paths: Vec::new(),
+        remote_image_urls: Vec::new(),
+    };
+    let width = 64;
+    let hyperlink_lines = cell.display_hyperlink_lines(width);
+
+    assert!(
+        hyperlink_lines
+            .iter()
+            .all(|line| line.width() <= usize::from(width)),
+        "every user-message row must fit its viewport: {hyperlink_lines:?}"
+    );
+
+    let linked_rows = hyperlink_lines
+        .iter()
+        .filter(|line| !line.hyperlinks.is_empty())
+        .collect::<Vec<_>>();
+    assert!(linked_rows.len() > 1, "expected the long URL to wrap");
+    assert!(
+        linked_rows.iter().all(|line| {
+            line.line
+                .spans
+                .first()
+                .is_some_and(|span| span.content == "  ")
+        }),
+        "wrapped URL rows must retain the user-message gutter: {linked_rows:?}"
+    );
+    assert!(
+        linked_rows.iter().all(|line| {
+            line.hyperlinks
+                .iter()
+                .all(|hyperlink| hyperlink.destination == url)
+        }),
+        "each wrapped URL fragment must preserve the complete clickable destination"
+    );
+
+    insta::assert_snapshot!(
+        "user_history_cell_wraps_long_urls_inside_the_message_gutter",
+        render_lines(&cell.display_lines(width)).join("\n")
+    );
+}
+
+#[test]
 fn user_history_cell_renders_remote_image_urls() {
     let cell = UserHistoryCell {
         message: "describe these".to_string(),
@@ -2407,7 +2479,7 @@ fn render_uses_wrapping_for_long_url_like_line() {
         .map(|y| {
             (0..area.width)
                 .map(|x| {
-                    let symbol = buf[(x, y)].symbol();
+                    let symbol = crate::terminal_hyperlinks::strip_osc8(buf[(x, y)].symbol());
                     if symbol.is_empty() {
                         ' '
                     } else {
@@ -2418,10 +2490,22 @@ fn render_uses_wrapping_for_long_url_like_line() {
         })
         .collect::<Vec<_>>();
     let rendered_blob = rendered.join("\n");
+    let rendered_url = rendered
+        .iter()
+        .filter(|row| !row.trim().is_empty())
+        .enumerate()
+        .map(|(index, row)| {
+            if index == 0 {
+                row.strip_prefix("› ").unwrap().trim()
+            } else {
+                row.trim()
+            }
+        })
+        .collect::<String>();
 
-    assert!(
-        rendered_blob.contains("session_id=abc123"),
-        "expected URL tail to be visible after wrapping, got:\n{rendered_blob}"
+    assert_eq!(
+        rendered_url, url,
+        "wrapped URL must preserve every character"
     );
 
     let non_empty_rows = rendered.iter().filter(|row| !row.trim().is_empty()).count() as u16;

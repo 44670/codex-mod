@@ -76,6 +76,7 @@ pub(super) fn mcp_init_error_display(
     server_name: &str,
     config: Option<&McpServerConfig>,
     error: &StartupOutcomeError,
+    reason: Option<McpStartupFailureReason>,
 ) -> String {
     if let Some(McpServerTransportConfig::StreamableHttp {
         url,
@@ -90,18 +91,19 @@ pub(super) fn mcp_init_error_display(
         format!(
             "GitHub MCP does not support OAuth. Log in by adding a personal access token (https://github.com/settings/personal-access-tokens) to your environment and config.toml:\n[mcp_servers.{server_name}]\nbearer_token_env_var = CODEX_GITHUB_PERSONAL_ACCESS_TOKEN"
         )
-    } else if error.is_authentication_required()
-        || matches!(
-                error,
-                StartupOutcomeError::Failed { error, .. } if error.contains("Auth required")
-        )
-    {
+    } else if error.is_authentication_required() {
         let recovery_hint = if config.is_some_and(|config| !config.is_local_environment()) {
             "Use your client's MCP OAuth sign-in flow.".to_string()
         } else {
             format!("Run `codex mcp login {server_name}`.")
         };
-        format!("The {server_name} MCP server is not logged in. {recovery_hint}")
+        let auth_status = match reason {
+            Some(McpStartupFailureReason::ReauthenticationRequired) => {
+                "requires OAuth reauthentication"
+            }
+            None => "is not logged in",
+        };
+        format!("The {server_name} MCP server {auth_status}. {recovery_hint}")
     } else if matches!(
         error,
         StartupOutcomeError::Failed { error, .. }

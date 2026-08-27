@@ -73,6 +73,7 @@ mod tests {
                 text: "kept".to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             },
             ThreadItem::McpToolCall {
                 id: "mcp-1".to_string(),
@@ -109,6 +110,7 @@ mod tests {
                 transparent_background: None,
                 failure: None,
                 saved_path: Some(test_path_buf("/tmp/ig-1.png").abs()),
+                imagegen_request_id: None,
             }),
         ]);
 
@@ -122,6 +124,7 @@ mod tests {
                 text: "kept".to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             }
         );
         assert_eq!(
@@ -202,6 +205,7 @@ mod tests {
             ephemeral: false,
             section: None,
             section_entered_at: None,
+            project_id: None,
             history_mode: Default::default(),
             model_provider: "mock_provider".to_string(),
             created_at: 0,

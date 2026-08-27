@@ -2,6 +2,7 @@ use anyhow::Context as _;
 use anyhow::ensure;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::ffi::OsString;
@@ -22,8 +23,11 @@ use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerEnvVar;
 use codex_config::types::McpServerTransportConfig;
 use codex_config::types::OAuthCredentialsStoreMode;
+use codex_core::EnvironmentConfig;
+use codex_core::EnvironmentMcpPolicy;
 use codex_core::TurnInputRequest;
 use codex_core::config::Config;
+use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::Environment;
 use codex_exec_server::HttpRedirectPolicy;
@@ -42,8 +46,13 @@ use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::Settings;
+use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::mcp_policy::McpServerIdentity;
+use codex_protocol::mcp_policy::McpServerRequirement;
+use codex_protocol::mcp_policy::PluginMcpRequirements;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::PermissionProfileSnapshot;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::InputModality;
@@ -52,7 +61,14 @@ use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::openai_models::TruncationPolicyConfig;
+use codex_protocol::permissions::FileSystemAccessMode;
+use codex_protocol::permissions::FileSystemPath;
+use codex_protocol::permissions::FileSystemSandboxEntry;
+use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::FileSystemSpecialPath;
+use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::McpInvocation;
 use codex_protocol::protocol::McpStartupFailureReason;
@@ -60,6 +76,8 @@ use codex_protocol::protocol::McpStartupStatus;
 use codex_protocol::protocol::McpToolCallBeginEvent;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
+use codex_protocol::protocol::TurnEnvironmentSelection;
+use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_protocol::user_input::UserInput;
 use codex_utils_cargo_bin::cargo_bin;
 use codex_utils_path_uri::PathUri;
@@ -74,6 +92,7 @@ use core_test_support::skip_if_no_network;
 use core_test_support::skip_if_no_remote_env;
 use core_test_support::skip_if_wine_exec;
 use core_test_support::stdio_server_bin;
+use core_test_support::submit_thread_settings;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
@@ -565,6 +584,270 @@ async fn mcp_namespace_instructions_are_preserved_without_hiding_tools() -> anyh
         responses::namespace_child_tool(&body, "mcp__bounded", "echo").is_some(),
         "preserving the namespace must not hide a valid MCP tool"
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn text_only_mcp_content_uses_content_items() -> anyhow::Result<()> {
+    skip_if_wine_exec!(
+        Ok(()),
+        "requires a Windows test_stdio_server in the Wine-exec environment"
+    );
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let call_id = "content-items-1";
+    let server_name = "rmcp";
+    let namespace = format!("mcp__{server_name}");
+    mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("resp-1"),
+            responses::ev_function_call_with_namespace(
+                call_id,
+                &namespace,
+                "image_scenario",
+                r#"{"scenario":"text_only","caption":"content item fixture result"}"#,
+            ),
+            responses::ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let final_mock = mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_assistant_message("msg-1", "done"),
+            responses::ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+
+    let command = remote_aware_stdio_server_bin()?;
+    let fixture = test_codex()
+        .with_model_info_override("gpt-5.4", |model| model.supports_search_tool = false)
+        .with_config(move |config| {
+            insert_mcp_server(
+                config,
+                server_name,
+                stdio_transport(command, /*env*/ None, Vec::new()),
+                TestMcpServerOptions {
+                    environment_id: remote_aware_environment_id(),
+                    ..Default::default()
+                },
+            );
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    wait_for_mcp_server(&fixture.codex, server_name).await?;
+
+    fixture
+        .codex
+        .start_or_steer_turn(read_only_user_turn(&fixture, "return content items"))
+        .await?;
+    wait_for_event(&fixture.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let output = final_mock.single_request().function_call_output(call_id);
+    let header = output["output"][0]["text"]
+        .as_str()
+        .expect("first content item should contain the wall-time header");
+    assert_wall_time_header(header);
+    assert_eq!(
+        output["output"],
+        json!([
+            {
+                "type": "input_text",
+                "text": header,
+            },
+            {
+                "type": "input_text",
+                "text": "content item fixture result",
+            },
+        ])
+    );
+
+    server.verify().await;
+    Ok(())
+}
+
+#[test_case(false; "configured servers")]
+#[test_case(true; "plugin servers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn environment_mcp_policy_filters_runtime_config_and_model_tools(
+    from_plugin: bool,
+) -> anyhow::Result<()> {
+    skip_if_wine_exec!(
+        Ok(()),
+        "requires a Windows test_stdio_server in the Wine-exec environment"
+    );
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let response = mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("resp-1"),
+            responses::ev_assistant_message("msg-1", "done"),
+            responses::ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let command = remote_aware_stdio_server_bin()?;
+    let allowed_command = command.clone();
+    let codex_home = Arc::new(tempdir()?);
+    if from_plugin {
+        let plugin_root =
+            super::plugins::write_sample_plugin_manifest_and_config(codex_home.as_ref());
+        let plugin_server = json!({
+            "command": command,
+            "environment_id": remote_aware_environment_id(),
+        });
+        fs::write(
+            plugin_root.join(".mcp.json"),
+            serde_json::to_vec(&json!({
+                "mcpServers": {
+                    "allowed": plugin_server,
+                    "blocked": plugin_server,
+                },
+            }))?,
+        )?;
+    }
+    let fixture = test_codex()
+        .with_home(codex_home)
+        .with_model_info_override("gpt-5.4", |model| model.supports_search_tool = false)
+        .with_config(move |config| {
+            if !from_plugin {
+                for server_name in ["allowed", "blocked"] {
+                    insert_mcp_server(
+                        config,
+                        server_name,
+                        stdio_transport(command.clone(), /*env*/ None, Vec::new()),
+                        TestMcpServerOptions {
+                            environment_id: remote_aware_environment_id(),
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+            insert_mcp_server(
+                config,
+                "unselected",
+                stdio_transport(command, /*env*/ None, Vec::new()),
+                TestMcpServerOptions {
+                    environment_id: "unselected-environment".to_string(),
+                    ..Default::default()
+                },
+            );
+        })
+        .build_with_auto_env(&server)
+        .await?;
+
+    let selection = fixture
+        .codex
+        .environment_selections()
+        .await
+        .into_iter()
+        .next()
+        .expect("thread should select its executor environment");
+    submit_thread_settings(
+        &fixture.codex,
+        ThreadSettingsOverrides {
+            environments: Some(TurnEnvironmentSelections::new(
+                fixture.config.cwd.clone(),
+                vec![TurnEnvironmentSelection {
+                    config: EnvironmentConfigState::Pending,
+                    ..selection.clone()
+                }],
+            )),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let (pending_config, _) = fixture.codex.current_mcp_config_and_runtime_context().await;
+    let pending_servers = pending_config.mcp_server_catalog.configured_servers();
+    assert!(!pending_servers["allowed"].enabled);
+    assert!(!pending_servers["unselected"].enabled);
+
+    let allowed_servers = BTreeMap::from([(
+        "allowed".to_string(),
+        McpServerRequirement::Identity {
+            identity: McpServerIdentity::Command {
+                command: allowed_command,
+            },
+        },
+    )]);
+    let mcp_policy = if from_plugin {
+        EnvironmentMcpPolicy {
+            servers: None,
+            plugins: Some(BTreeMap::from([(
+                "sample@test".to_string(),
+                PluginMcpRequirements {
+                    mcp_servers: Some(allowed_servers),
+                },
+            )])),
+        }
+    } else {
+        EnvironmentMcpPolicy {
+            servers: Some(allowed_servers),
+            plugins: None,
+        }
+    };
+
+    fixture
+        .codex
+        .environment_ready(
+            &selection,
+            EnvironmentConfig {
+                allow_login_shell: true,
+                workspace_roots: selection.workspace_roots.clone(),
+                permission_profile: PermissionProfileSnapshot::legacy(
+                    fixture.config.permissions.permission_profile().clone(),
+                ),
+                shell_environment_policy: Default::default(),
+                windows_sandbox_level: WindowsSandboxLevel::from_config(&fixture.config),
+                windows_sandbox_private_desktop: fixture
+                    .config
+                    .permissions
+                    .windows_sandbox_private_desktop,
+                use_legacy_landlock: fixture.config.features.use_legacy_landlock(),
+                exec_policy: None,
+                mcp_policy: Some(mcp_policy),
+                network_policy: None,
+                selected_capability_roots: Vec::new(),
+            },
+        )
+        .await?;
+
+    let (runtime_config, _) = fixture.codex.current_mcp_config_and_runtime_context().await;
+    let runtime_servers = runtime_config.mcp_server_catalog.configured_servers();
+    assert!(!runtime_servers["blocked"].enabled);
+    assert!(!runtime_servers["unselected"].enabled);
+    fixture
+        .codex
+        .call_mcp_tool(
+            "allowed",
+            "echo",
+            Some(json!({ "message": "ready" })),
+            /*meta*/ None,
+        )
+        .await?;
+
+    fixture
+        .submit_text_turn("show the available MCP tools")
+        .await?;
+    let body = response.single_request().body_json();
+    assert!(responses::namespace_child_tool(&body, "mcp__allowed", "echo").is_some());
+    assert!(responses::namespace_child_tool(&body, "mcp__blocked", "echo").is_none());
+
+    fixture
+        .codex
+        .environment_failed(&selection, "environment policy unavailable".to_string())
+        .await?;
+    let (failed_config, _) = fixture.codex.current_mcp_config_and_runtime_context().await;
+    let failed_servers = failed_config.mcp_server_catalog.configured_servers();
+    assert!(!failed_servers["allowed"].enabled);
     Ok(())
 }
 
@@ -1238,7 +1521,10 @@ async fn stdio_server_uses_configured_cwd_before_runtime_fallback() -> anyhow::R
             let configured_cwd_uri = PathUri::from_host_native_path(&configured_cwd)?;
             fs.create_directory(
                 &configured_cwd_uri,
-                CreateDirectoryOptions { recursive: true },
+                CreateDirectoryOptions {
+                    recursive: true,
+                    follow_symlinks: true,
+                },
                 /*sandbox*/ None,
             )
             .await?;
@@ -1347,14 +1633,16 @@ async fn local_stdio_server_uses_runtime_fallback_cwd_when_config_omits_cwd() ->
     Ok(())
 }
 
-#[test_case(false, false; "both disabled")]
-#[test_case(true, false; "auto review required")]
-#[test_case(false, true; "disabled")]
-#[test_case(true, true; "both enabled")]
+#[test_case(false, false, false; "both disabled")]
+#[test_case(true, false, false; "auto review required")]
+#[test_case(false, true, false; "disabled")]
+#[test_case(true, true, false; "both enabled")]
+#[test_case(false, false, true; "attachment-owned permissions preserve foreign workspace roots")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn stdio_mcp_tool_call_includes_sandbox_state_meta(
     node_repl_auto_review_required: bool,
     node_repl_disabled: bool,
+    attachment_owned_permissions: bool,
 ) -> anyhow::Result<()> {
     // TODO(anp): Remove after packaging a Windows stdio test server for Wine exec.
     skip_if_wine_exec!(
@@ -1366,6 +1654,7 @@ async fn stdio_mcp_tool_call_includes_sandbox_state_meta(
     let server = responses::start_mock_server().await;
 
     let call_id = "sandbox-meta-call";
+    let restricted_call_id = "owner-restricted-call";
     let server_name = "rmcp";
     let namespace = format!("mcp__{server_name}");
     let mut models = codex_models_manager::bundled_models_response()?;
@@ -1378,15 +1667,20 @@ async fn stdio_mcp_tool_call_includes_sandbox_state_meta(
     model.node_repl_disabled = node_repl_disabled;
     let models_mock = mount_models_once(&server, models).await;
 
-    let initial_mock = mount_sse_once(
-        &server,
-        responses::sse(vec![
-            responses::ev_response_created("resp-1"),
-            responses::ev_function_call_with_namespace(call_id, &namespace, "sandbox_meta", "{}"),
-            responses::ev_completed("resp-1"),
-        ]),
-    )
-    .await;
+    let mut response_events = vec![
+        responses::ev_response_created("resp-1"),
+        responses::ev_function_call_with_namespace(call_id, &namespace, "sandbox_meta", "{}"),
+    ];
+    if attachment_owned_permissions {
+        response_events.push(responses::ev_function_call_with_namespace(
+            restricted_call_id,
+            &namespace,
+            "sync",
+            "{}",
+        ));
+    }
+    response_events.push(responses::ev_completed("resp-1"));
+    let initial_mock = mount_sse_once(&server, responses::sse(response_events)).await;
     let final_mock = mount_sse_once(
         &server,
         responses::sse(vec![
@@ -1415,6 +1709,88 @@ async fn stdio_mcp_tool_call_includes_sandbox_state_meta(
         .await?;
 
     wait_for_mcp_server(&fixture.codex, server_name).await?;
+    let owner_permission_profile = if attachment_owned_permissions {
+        PermissionProfile::from_runtime_permissions(
+            &FileSystemSandboxPolicy::restricted(vec![
+                FileSystemSandboxEntry::new(
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::Root,
+                    },
+                    FileSystemAccessMode::Write,
+                ),
+                FileSystemSandboxEntry::new(
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+                    },
+                    FileSystemAccessMode::Read,
+                ),
+                FileSystemSandboxEntry::new(
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::project_roots(Some(".git".to_string())),
+                    },
+                    FileSystemAccessMode::Read,
+                ),
+            ]),
+            NetworkSandboxPolicy::Restricted,
+        )
+    } else {
+        PermissionProfile::read_only()
+    };
+    let owner_workspace_roots = if attachment_owned_permissions {
+        let selection = fixture
+            .codex
+            .environment_selections()
+            .await
+            .into_iter()
+            .find(|selection| selection.environment_id == remote_aware_environment_id())
+            .context("thread should select the MCP server's executor environment")?;
+        let workspace_roots = vec![PathUri::parse(if cfg!(windows) {
+            "file:///foreign/workspace"
+        } else {
+            "file:///C:/workspace"
+        })?];
+        submit_thread_settings(
+            &fixture.codex,
+            ThreadSettingsOverrides {
+                environments: Some(TurnEnvironmentSelections::new(
+                    fixture.config.cwd.clone(),
+                    vec![TurnEnvironmentSelection {
+                        config: EnvironmentConfigState::Pending,
+                        ..selection.clone()
+                    }],
+                )),
+                ..Default::default()
+            },
+        )
+        .await?;
+        fixture
+            .codex
+            .environment_ready(
+                &selection,
+                EnvironmentConfig {
+                    allow_login_shell: fixture.config.permissions.allow_login_shell,
+                    workspace_roots: workspace_roots.clone(),
+                    permission_profile: PermissionProfileSnapshot::legacy(
+                        owner_permission_profile.clone(),
+                    ),
+                    shell_environment_policy: Default::default(),
+                    windows_sandbox_level: WindowsSandboxLevel::from_config(&fixture.config),
+                    windows_sandbox_private_desktop: fixture
+                        .config
+                        .permissions
+                        .windows_sandbox_private_desktop,
+                    use_legacy_landlock: fixture.config.features.use_legacy_landlock(),
+                    exec_policy: None,
+                    mcp_policy: None,
+                    network_policy: None,
+                    selected_capability_roots: Vec::new(),
+                },
+            )
+            .await?;
+        workspace_roots
+    } else {
+        Vec::new()
+    };
     fixture
         .thread_manager
         .get_models_manager()
@@ -1428,7 +1804,11 @@ async fn stdio_mcp_tool_call_includes_sandbox_state_meta(
     fixture
         .submit_turn_with_permission_profile(
             "call the rmcp sandbox_meta tool",
-            PermissionProfile::read_only(),
+            if attachment_owned_permissions {
+                PermissionProfile::Disabled
+            } else {
+                PermissionProfile::read_only()
+            },
         )
         .await?;
 
@@ -1447,7 +1827,20 @@ async fn stdio_mcp_tool_call_includes_sandbox_state_meta(
         json!(node_repl_disabled)
     );
 
-    let output_item = final_mock.single_request().function_call_output(call_id);
+    let final_request = final_mock.single_request();
+    if attachment_owned_permissions {
+        let restricted_output_item = final_request.function_call_output(restricted_call_id);
+        let restricted_output = restricted_output_item["output"][1]["text"]
+            .as_str()
+            .expect("restricted MCP tool should produce a denied call output");
+        assert!(
+            restricted_output
+                .contains("MCP tool call requires approval, but approval policy is never"),
+            "attachment-owned permissions should deny the mutable MCP tool: {restricted_output}"
+        );
+    }
+
+    let output_item = final_request.function_call_output(call_id);
     let output_text = output_item
         .get("output")
         .and_then(Value::as_str)
@@ -1471,10 +1864,26 @@ async fn stdio_mcp_tool_call_includes_sandbox_state_meta(
         .get(MCP_SANDBOX_STATE_META_CAPABILITY)
         .expect("sandbox state metadata should be present");
     let sandbox_state: SandboxState = serde_json::from_value(sandbox_meta.clone())?;
+    if attachment_owned_permissions {
+        let workspace_root = &owner_workspace_roots[0];
+        for path in [workspace_root.clone(), workspace_root.join(".git")?] {
+            let expected_entry =
+                FileSystemSandboxEntry::new(path.into(), FileSystemAccessMode::Read);
+            assert!(
+                sandbox_state
+                    .permission_profile
+                    .file_system_sandbox_policy()
+                    .entries
+                    .contains(&expected_entry),
+                "foreign workspace root should retain its owner restriction: {expected_entry:?}"
+            );
+        }
+    }
     assert_eq!(
         sandbox_state,
         SandboxState {
-            permission_profile: PermissionProfile::read_only(),
+            permission_profile: owner_permission_profile
+                .materialize_project_roots_with_path_uris(&owner_workspace_roots),
             codex_linux_sandbox_exe: fixture.config.codex_linux_sandbox_exe.clone(),
             sandbox_cwd: PathUri::from_abs_path(&fixture.config.cwd),
             use_legacy_landlock: false,
@@ -2261,7 +2670,7 @@ async fn stdio_image_responses_are_sanitized_for_text_only_model() -> anyhow::Re
                     effort: codex_protocol::openai_models::ReasoningEffort::Medium,
                     description: "Medium".to_string(),
                 }],
-                shell_type: ConfigShellToolType::Default,
+                shell_type: ConfigShellToolType::UnifiedExec,
                 visibility: ModelVisibility::List,
                 supported_in_api: true,
                 priority: 1,
@@ -2281,7 +2690,6 @@ async fn stdio_image_responses_are_sanitized_for_text_only_model() -> anyhow::Re
                 apply_patch_tool_type: None,
                 web_search_tool_type: Default::default(),
                 truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
-                supports_parallel_tool_calls: false,
                 supports_image_detail_original: false,
                 context_window: Some(272_000),
                 max_context_window: None,
@@ -2380,19 +2788,19 @@ async fn stdio_image_responses_are_sanitized_for_text_only_model() -> anyhow::Re
     wait_for_event(&fixture.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let output_item = final_mock.single_request().function_call_output(call_id);
-    let output_text = output_item
-        .get("output")
-        .and_then(Value::as_str)
-        .expect("function_call_output output should be a JSON string");
-    let wrapped_payload = split_wall_time_wrapped_output(output_text);
-    let output_json: Value = serde_json::from_str(wrapped_payload)
-        .expect("function_call_output output should be valid JSON");
+    let header = output_item["output"][0]["text"]
+        .as_str()
+        .expect("first content item should contain the wall-time header");
+    assert_wall_time_header(header);
     assert_eq!(
-        output_json,
-        json!([{
-            "type": "text",
-            "text": "<image content omitted because you do not support image input>"
-        }])
+        output_item["output"],
+        json!([
+            {"type": "input_text", "text": header},
+            {
+                "type": "input_text",
+                "text": "<image content omitted because you do not support image input>",
+            },
+        ])
     );
     server.verify().await;
     Ok(())
@@ -3289,13 +3697,22 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
         .build_with_auto_env(&server)
         .await?;
     // Phase 5: replace rejected credentials as an external OAuth login would.
-    let mut failure_reason = None;
+    let recovery_hint = if credential_config.is_local_environment() {
+        format!("Run `codex mcp login {server_name}`.")
+    } else {
+        "Use your client's MCP OAuth sign-in flow.".to_string()
+    };
+    let expected_failure = (
+        format!("The {server_name} MCP server requires OAuth reauthentication. {recovery_hint}"),
+        Some(McpStartupFailureReason::ReauthenticationRequired),
+    );
+    let mut failure = None;
     let startup = wait_for_event(&fixture.codex, |event| {
         if let EventMsg::McpStartupUpdate(update) = event
             && update.server == server_name
-            && let McpStartupStatus::Failed { reason, .. } = &update.status
+            && let McpStartupStatus::Failed { error, reason } = &update.status
         {
-            failure_reason = *reason;
+            failure = Some((error.clone(), *reason));
         }
         matches!(event, EventMsg::McpStartupComplete(_))
     })
@@ -3305,10 +3722,7 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
     };
     assert_eq!(startup.failed.len(), 1);
     assert_eq!(startup.failed[0].server, server_name);
-    assert_eq!(
-        failure_reason,
-        Some(McpStartupFailureReason::ReauthenticationRequired),
-    );
+    assert_eq!(failure, Some(expected_failure.clone()));
 
     let store_lock = fs::OpenOptions::new()
         .read(true)
@@ -3322,23 +3736,23 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
             "continue while OAuth credentials are locked",
         ))
         .await?;
-    let (contended_turn, refreshed_failure_reason, refreshed_failed_servers) =
+    let (contended_turn, refreshed_failure, refreshed_failed_servers) =
         tokio::time::timeout(Duration::from_secs(5), async {
             let mut contended_turn = None;
-            let mut refreshed_failure_reason = None;
+            let mut refreshed_failure = None;
             let mut refreshed_failed_servers = None;
             let mut refreshed_starting = false;
             while contended_turn.is_none()
-                || refreshed_failure_reason.is_none()
+                || refreshed_failure.is_none()
                 || refreshed_failed_servers.is_none()
             {
                 match fixture.codex.next_event().await?.msg {
                     EventMsg::McpStartupUpdate(update) if update.server == server_name => {
                         match update.status {
                             McpStartupStatus::Starting => refreshed_starting = true,
-                            McpStartupStatus::Failed { reason, .. } => {
+                            McpStartupStatus::Failed { error, reason } => {
                                 assert!(refreshed_starting);
-                                refreshed_failure_reason = Some(reason);
+                                refreshed_failure = Some((error, reason));
                             }
                             McpStartupStatus::Ready | McpStartupStatus::Cancelled => {}
                         }
@@ -3352,16 +3766,13 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
             }
             Ok::<_, anyhow::Error>((
                 contended_turn.expect("turn completion was observed"),
-                refreshed_failure_reason.expect("failure status was observed"),
+                refreshed_failure.expect("failure status was observed"),
                 refreshed_failed_servers.expect("startup summary was observed"),
             ))
         })
         .await
         .context("OAuth credential-store contention blocked the user turn or startup status")??;
-    assert_eq!(
-        refreshed_failure_reason,
-        Some(McpStartupFailureReason::ReauthenticationRequired),
-    );
+    assert_eq!(refreshed_failure, expected_failure);
     assert_eq!(
         refreshed_failed_servers
             .into_iter()
@@ -3923,6 +4334,7 @@ fn write_fallback_oauth_tokens(
         "server_name": server_name,
         "url": server_url,
         "client_id": client_id,
+        "issuer": server_url,
         "token_response": {
             "access_token": access_token,
             "token_type": "Bearer",

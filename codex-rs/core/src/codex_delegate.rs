@@ -42,6 +42,10 @@ use codex_protocol::turn_input::TurnStartOptions;
 #[cfg(test)]
 use crate::session::completed_session_loop_termination;
 
+pub(crate) struct GuardianReadOnlyHistoryTools(
+    pub(crate) Vec<Arc<dyn for<'call> codex_tools::ToolExecutor<codex_tools::ToolCall<'call>>>>,
+);
+
 /// Start an interactive sub-Codex thread and return its runtime and IO channels.
 ///
 /// Delegates never request approvals, and the returned IO yields their public events.
@@ -66,6 +70,10 @@ pub(crate) async fn run_codex_thread_interactive(
         ));
     }
     config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
+    config.model_provider.supports_websockets &= parent_session
+        .services
+        .model_client
+        .responses_websocket_enabled();
 
     let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
     let (tx_ops, rx_ops) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
@@ -74,6 +82,34 @@ pub(crate) async fn run_codex_thread_interactive(
     let user_instructions = LoadedUserInstructions {
         instructions: parent_session.user_instructions().await,
         warnings: Vec::new(),
+    };
+    let session_source = SessionSource::SubAgent(subagent_source.clone());
+    let is_guardian_reviewer = crate::guardian::is_basic_session_source(&session_source);
+    let mut thread_extension_init = codex_extension_api::ExtensionDataInit::default();
+    if is_guardian_reviewer {
+        let history_tools = crate::tools::spec_plan::extension_tool_executors(
+            parent_session.as_ref(),
+            parent_ctx.extension_data.as_ref(),
+        )
+        .filter(|executor| {
+            let name = executor.tool_name();
+            matches!(
+                (name.namespace.as_deref(), name.name.as_str()),
+                (
+                    Some("history"),
+                    "list_windows" | "list_items" | "read_item" | "search_contents"
+                )
+            )
+        })
+        .collect::<Vec<_>>();
+        if !history_tools.is_empty() {
+            thread_extension_init.insert(GuardianReadOnlyHistoryTools(history_tools));
+        }
+    }
+    let extensions = if is_guardian_reviewer {
+        codex_extension_api::empty_extension_registry()
+    } else {
+        Arc::clone(&parent_session.services.extensions)
     };
     let (session, io) = Box::pin(Session::spawn(SessionSpawnArgs {
         config,
@@ -90,14 +126,18 @@ pub(crate) async fn run_codex_thread_interactive(
         plugins_manager: Arc::clone(&parent_session.services.plugins_manager),
         mcp_manager: Arc::clone(&parent_session.services.mcp_manager),
         code_mode_session_provider: parent_session.services.code_mode_service.session_provider(),
-        extensions: Arc::clone(&parent_session.services.extensions),
+        extensions,
         conversation_history,
         requested_history_mode: None,
         fork_persistence: ForkPersistence::Copied,
-        session_source: SessionSource::SubAgent(subagent_source.clone()),
+        session_source,
         forked_from_thread_id,
         parent_thread_id: Some(parent_session.thread_id),
-        thread_source: Some(ThreadSource::Subagent),
+        thread_source: Some(if is_guardian_reviewer {
+            ThreadSource::GuardianReview
+        } else {
+            ThreadSource::Subagent
+        }),
         originator: parent_ctx.originator.clone(),
         agent_control: parent_session.services.agent_control.clone(),
         dynamic_tools: Vec::new(),
@@ -108,8 +148,9 @@ pub(crate) async fn run_codex_thread_interactive(
         parent_rollout_thread_trace: codex_rollout_trace::ThreadTraceContext::disabled(),
         parent_trace: None,
         environment_selections: parent_environments.to_selections(),
-        thread_extension_init: codex_extension_api::ExtensionDataInit::default(),
+        thread_extension_init,
         client_mcp_extensions: parent_session.services.client_mcp_extensions.clone(),
+        reserved_thread_id: None,
         analytics_events_client: Some(parent_session.services.analytics_events_client.clone()),
         thread_store: Arc::clone(&parent_session.services.thread_store),
         attestation_provider: parent_session.services.attestation_provider.clone(),
@@ -198,8 +239,10 @@ pub(crate) async fn run_codex_thread_one_shot(
         .submit_turn_input(
             TurnInputRequest::user_input(input).on_start(TurnStartOptions {
                 final_output_json_schema,
+                service_tier: None,
                 parent_turn_id: Some(parent_turn_id),
                 root_turn_id,
+                ..Default::default()
             }),
             TurnInputMode::StartIfIdle,
         )

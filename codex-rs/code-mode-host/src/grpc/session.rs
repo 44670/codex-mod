@@ -71,6 +71,7 @@ pub(super) struct SessionState {
 
 pub(super) struct ExecutionState {
     pub(super) execution_id: String,
+    pub(super) traceparent: Option<String>,
     pub(super) tool_call_sequence: u64,
     permit: OwnedSemaphorePermit,
 }
@@ -125,11 +126,6 @@ impl GrpcHostState {
             }))
             .map_err(|_| Status::internal("failed to publish the opened code-mode session"))?;
         let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
-        if sessions.len() >= MAX_IN_FLIGHT_REQUESTS {
-            return Err(Status::resource_exhausted(
-                "code-mode host has too many open sessions",
-            ));
-        }
         sessions.insert(id, Arc::clone(&session));
         drop(sessions);
 
@@ -301,6 +297,7 @@ impl GrpcSession {
         execution_id: String,
         cell_id: String,
         permit: OwnedSemaphorePermit,
+        traceparent: Option<String>,
     ) -> Result<(), Status> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if !state.pending_executions.remove(&execution_id) {
@@ -313,6 +310,7 @@ impl GrpcSession {
         };
         entry.insert(ExecutionState {
             execution_id,
+            traceparent,
             tool_call_sequence: 0,
             permit,
         });
