@@ -1,5 +1,8 @@
 use super::step_settings::ResolvedStepSettings;
+use super::token_budget::has_explicit_settings;
+use super::token_budget::resolve_token_budget;
 use super::*;
+use crate::config::TokenBudgetConfig;
 use crate::environment_selection::EnvironmentConfigOrigin;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::exec_policy::AllowPrefixRules;
@@ -45,9 +48,13 @@ pub(crate) struct TurnEnvironment {
     pub(crate) selection: TurnEnvironmentSelection,
     pub(crate) config_origin: EnvironmentConfigOrigin,
     pub(crate) environment: Arc<Environment>,
+    /// Cached from the selected executor; `None` means it did not report one.
+    pub(crate) user_home_dir: Option<PathUri>,
     /// Cached from the selected executor; `None` means it did not report them.
     pub(crate) temporary_directories: Option<Vec<PathUri>>,
     pub(crate) shell: Option<shell::Shell>,
+    /// OS reported by the selected executor; `None` for legacy executors.
+    pub(crate) executor_platform_os: Option<String>,
     pub(crate) shell_snapshot: ShellSnapshotTask,
     pub(crate) shell_snapshot_v2_supported: bool,
 }
@@ -64,8 +71,10 @@ impl TurnEnvironment {
             selection,
             config_origin,
             environment,
+            user_home_dir: None,
             temporary_directories: None,
             shell,
+            executor_platform_os: None,
             shell_snapshot: futures::future::ready(None).boxed().shared(),
             shell_snapshot_v2_supported: false,
         }
@@ -128,6 +137,7 @@ impl TurnEnvironment {
             permissions: permissions.into(),
             cwd: Some(self.cwd().clone()),
             workspace_roots: self.workspace_roots().to_vec(),
+            user_home_dir: self.user_home_dir.clone(),
             temporary_directories: self.temporary_directories.clone(),
             windows_sandbox_level: executor_windows_sandbox_level(
                 config.windows_sandbox_level,
@@ -162,8 +172,10 @@ impl std::fmt::Debug for TurnEnvironment {
             .field("environment", &self.environment)
             .field("cwd", &self.selection.cwd)
             .field("workspace_roots", &self.config().workspace_roots)
+            .field("user_home_dir", &self.user_home_dir)
             .field("temporary_directories", &self.temporary_directories)
             .field("shell", &self.shell)
+            .field("executor_platform_os", &self.executor_platform_os)
             .field("config", self.config())
             .field("config_origin", &self.config_origin)
             .finish_non_exhaustive()
@@ -173,6 +185,7 @@ impl std::fmt::Debug for TurnEnvironment {
 /// Request options for one turn, separate from persistent thread settings.
 #[derive(Default)]
 pub(crate) struct NewTurnContextOptions {
+    pub(crate) guardian_ticket: Option<codex_protocol::guardian_ticket::GuardianTicket>,
     pub(crate) final_output_json_schema: Option<Value>,
     pub(crate) cyber_access_program: Option<CyberAccessProgram>,
 }
@@ -180,6 +193,8 @@ pub(crate) struct NewTurnContextOptions {
 /// The context needed for a single turn of the thread.
 #[derive(Debug)]
 pub struct TurnContext {
+    /// Receipt selected for this Guardian turn, separate from its own responses.
+    pub(crate) guardian_ticket: Option<codex_protocol::guardian_ticket::GuardianTicket>,
     pub(crate) sub_id: String,
     pub(crate) trace_id: Option<String>,
     pub(crate) realtime_active: bool,
@@ -187,6 +202,10 @@ pub struct TurnContext {
     /// Turn-scoped configuration. Read step-specific settings such as service tier and
     /// approvals reviewer from the corresponding `StepContext` instead.
     pub config: Arc<Config>,
+    /// Preferences captured before token-budget defaults from the turn's initial model.
+    pub(crate) configured_token_budget: Option<TokenBudgetConfig>,
+    /// Captured once so later steps do not re-read config layers to detect user preferences.
+    pub(crate) use_model_token_budget_defaults: bool,
     pub(crate) auth_manager: Option<Arc<AuthManager>>,
     /// Frozen settings used to construct this context. Legacy turn consumers
     /// keep this view even when later steps use different settings.
@@ -425,12 +444,7 @@ impl TurnContext {
     /// Legacy: returns the frozen initial-turn model context window.
     /// Step-scoped consumers should use their captured `StepContext::settings`.
     pub(crate) fn model_context_window(&self) -> Option<i64> {
-        let effective_context_window_percent = self.model_info().effective_context_window_percent;
-        self.model_info()
-            .resolved_context_window()
-            .map(|context_window| {
-                context_window.saturating_mul(effective_context_window_percent) / 100
-            })
+        self.model_info().usable_context_window()
     }
 
     pub(crate) fn apps_enabled(&self) -> bool {
@@ -503,6 +517,8 @@ impl TurnContext {
             realtime_active: self.realtime_active,
             code_mode_available: self.code_mode_available,
             config: Arc::new(config),
+            configured_token_budget: self.configured_token_budget.clone(),
+            use_model_token_budget_defaults: self.use_model_token_budget_defaults,
             auth_manager: self.auth_manager.clone(),
             initial_settings: Arc::clone(&step_settings),
             current_settings: ArcSwap::from(step_settings),
@@ -524,6 +540,7 @@ impl TurnContext {
             windows_sandbox_level: self.windows_sandbox_level,
             available_models,
             unified_exec_shell_mode: self.unified_exec_shell_mode.clone(),
+            guardian_ticket: self.guardian_ticket.clone(),
             final_output_json_schema: self.final_output_json_schema.clone(),
             dynamic_tools: self.dynamic_tools.clone(),
             turn_metadata_state: self.turn_metadata_state.clone(),
@@ -565,6 +582,7 @@ impl TurnContext {
         let cwd = self.cwd.clone();
         TurnContextItem {
             turn_id: Some(self.sub_id.clone()),
+            root_turn_id: self.turn_metadata_state.root_turn_id(),
             cwd,
             workspace_roots: (!workspace_roots.is_empty()).then_some(workspace_roots),
             current_date: self.current_date.clone(),
@@ -725,7 +743,15 @@ impl Session {
         );
 
         let mut per_turn_config = per_turn_config;
-        super::token_budget::apply_model_defaults(&mut per_turn_config, model_info);
+        let configured_token_budget = per_turn_config.token_budget.clone();
+        let use_model_token_budget_defaults =
+            per_turn_config.features.enabled(Feature::TokenBudget)
+                && !has_explicit_settings(&per_turn_config);
+        per_turn_config.token_budget = resolve_token_budget(
+            configured_token_budget.as_ref(),
+            use_model_token_budget_defaults,
+            model_info,
+        );
         if step_settings.reasoning_effort() == Some(&ReasoningEffort::Persistent) {
             super::time_reminder::apply_persistent_defaults(&mut per_turn_config);
         }
@@ -759,11 +785,14 @@ impl Session {
         let extension_data = Arc::new(codex_extension_api::ExtensionData::new(sub_id.clone()));
         extension_data.insert(skills_snapshot);
         TurnContext {
+            guardian_ticket: None,
             sub_id,
             trace_id: current_span_trace_id(),
             realtime_active: false,
             code_mode_available: true,
             config: per_turn_config,
+            configured_token_budget,
+            use_model_token_budget_defaults,
             auth_manager,
             initial_settings: Arc::clone(&step_settings),
             current_settings: ArcSwap::from(step_settings),
@@ -1000,6 +1029,7 @@ impl Session {
         turn_context.extension_data.insert(trusted_plugin_roots);
         turn_context.realtime_active = self.conversation.running_state().await.is_some();
 
+        turn_context.guardian_ticket = options.guardian_ticket;
         turn_context.final_output_json_schema = options.final_output_json_schema;
         if turn_context.config.model_provider_id == codex_model_provider_info::OPENAI_PROVIDER_ID {
             turn_context.cyber_access_program = options.cyber_access_program;
@@ -1011,7 +1041,9 @@ impl Session {
                 .single_local_environment_cwd()
                 .is_some()
         {
-            turn_context.turn_metadata_state.spawn_git_enrichment_task();
+            turn_context
+                .turn_metadata_state
+                .spawn_git_enrichment_task(Arc::clone(&self.services.git_root_discovery));
         }
         turn_context
     }
@@ -1032,14 +1064,14 @@ impl Session {
 
         if !tc.code_mode_available
             && matches!(
-                crate::tools::requested_tool_mode(tc),
+                crate::tools::requested_tool_mode(tc, tc.model_info()),
                 codex_protocol::openai_models::ToolMode::CodeMode
                     | codex_protocol::openai_models::ToolMode::CodeModeOnly
             )
             && let Some(message) = self
                 .services
                 .code_mode_service
-                .take_unavailable_warning(crate::tools::effective_tool_mode(tc))
+                .take_unavailable_warning(crate::tools::effective_tool_mode(tc, tc.model_info()))
         {
             self.send_event(tc, EventMsg::Warning(WarningEvent { message }))
                 .await;

@@ -24,8 +24,12 @@ mod turn_lifecycle;
 mod world_state;
 
 pub use approval_review::ApprovalAssessment;
+pub use approval_review::ApprovalDecision;
+pub use approval_review::ApprovalDecisionInput;
 pub use approval_review::ApprovalReviewError;
 pub use approval_review::ApprovalReviewInput;
+pub use approval_review::GuardianV2Enabled;
+pub use approval_review::SynchronousApprovalReviewer;
 pub use context::TurnContextContributionInput;
 pub use mcp::McpServerContribution;
 pub use mcp::McpServerContributionContext;
@@ -43,6 +47,7 @@ pub use thread_lifecycle::ThreadResumeInput;
 pub use thread_lifecycle::ThreadStartInput;
 pub use thread_lifecycle::ThreadStopInput;
 pub use tool_lifecycle::McpToolContext;
+pub use tool_lifecycle::McpToolResultInput;
 pub use tool_lifecycle::McpToolSource;
 pub use tool_lifecycle::ToolCallOutcome;
 pub use tool_lifecycle::ToolFinishInput;
@@ -318,15 +323,20 @@ pub trait ToolContributor: Send + Sync {
 
 /// Contributor for host-owned tool lifecycle gates.
 ///
-/// Implementations should use these callbacks to observe tool execution and its
-/// exposed input without rewriting the invocation. Use `ToolContributor` for
-/// owning a tool implementation and hooks for policy that changes tool payloads.
+/// Implementations can observe tool execution and process MCP responses without
+/// rewriting the invocation. Use `ToolContributor` for owning a tool implementation
+/// and hooks for policy that changes tool payloads.
 pub trait ToolLifecycleContributor: Send + Sync {
     /// Called after pre-tool hooks finalize an invocation and before execution.
     ///
     /// Calls blocked by hooks, or whose hook-provided input cannot be applied,
     /// do not reach this callback.
     fn on_tool_start<'a>(&'a self, _input: ToolStartInput<'a>) -> ToolLifecycleFuture<'a> {
+        Box::pin(std::future::ready(()))
+    }
+
+    /// Runs before the MCP result is sent to the client and model.
+    fn on_mcp_tool_result<'a>(&'a self, _input: McpToolResultInput<'a>) -> ToolLifecycleFuture<'a> {
         Box::pin(std::future::ready(()))
     }
 
@@ -345,6 +355,14 @@ pub trait ToolLifecycleContributor: Send + Sync {
 /// a full structured review, or support both paths. Returning `None` leaves the
 /// request available to the next contributor or the host's fallback path.
 pub trait ApprovalReviewContributor: Send + Sync {
+    /// Claims one request, including a handoff to the user.
+    fn decide<'a>(
+        &'a self,
+        _input: &'a ApprovalDecisionInput<'_>,
+    ) -> ExtensionFuture<'a, Option<ApprovalDecision>> {
+        Box::pin(std::future::ready(None))
+    }
+
     /// Returns an available approval decision without performing a full review.
     fn fast_decision<'a>(
         &'a self,

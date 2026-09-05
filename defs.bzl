@@ -227,7 +227,8 @@ def codex_rust_crate(
             Crates are only compiled in a single configuration across the workspace, i.e.
             with all features in this list enabled. So use sparingly, and prefer to refactor
             optional functionality to a separate crate.
-        crate_srcs: Optional explicit srcs; defaults to `src/**/*.rs`.
+        crate_srcs: Optional explicit library srcs; [] disables the library target.
+            Defaults to `src/**/*.rs` excluding binary entrypoints.
         crate_edition: Rust edition override, if not default.
             You probably don't want this, it's only here for a single caller.
         proc_macro: Whether this crate builds a proc-macro library.
@@ -303,7 +304,7 @@ def codex_rust_crate(
 
     binaries = DEP_DATA.get(native.package_name())["binaries"]
 
-    lib_srcs = crate_srcs or native.glob(["src/**/*.rs"], exclude = binaries.values(), allow_empty = True)
+    lib_srcs = crate_srcs if crate_srcs != None else native.glob(["src/**/*.rs"], exclude = binaries.values(), allow_empty = True)
 
     maybe_deps = []
 
@@ -458,10 +459,11 @@ def codex_rust_crate(
     integration_test_binaries = sanitized_binaries
     integration_test_cargo_env = cargo_env
     integration_test_cargo_env_runfiles = cargo_env_runfiles
+    integration_test_files = native.glob(["tests/**"], allow_empty = True)
     integration_test_data_extra = [
         data
         for data in test_data_extra
-        if data not in cargo_env_runfiles
+        if data not in cargo_env_runfiles and data not in integration_test_files
     ]
     non_windows_sanitized_binaries = []
     non_windows_cargo_env = {}
@@ -545,8 +547,8 @@ def codex_rust_crate(
                 crate_name = test_crate_name,
                 crate_root = test,
                 srcs = [test],
-                data = native.glob(["tests/**"], allow_empty = True) + integration_test_binaries + integration_test_data_extra,
-                compile_data = native.glob(["tests/**"], allow_empty = True) + integration_compile_data_extra,
+                data = integration_test_files + integration_test_binaries + integration_test_data_extra,
+                compile_data = integration_test_files + integration_compile_data_extra,
                 deps = all_crate_deps(normal = True, normal_dev = True) + maybe_deps + deps_extra,
                 # Bazel has emitted both `codex-rs/<crate>/...` and
                 # `../codex-rs/<crate>/...` paths for `file!()`. Strip either
@@ -585,8 +587,8 @@ def codex_rust_crate(
                 crate_name = test_crate_name,
                 crate_root = test,
                 srcs = [test],
-                data = native.glob(["tests/**"], allow_empty = True) + integration_test_binaries + integration_test_data_extra,
-                compile_data = native.glob(["tests/**"], allow_empty = True) + integration_compile_data_extra,
+                data = integration_test_files + integration_test_binaries + integration_test_data_extra,
+                compile_data = integration_test_files + integration_compile_data_extra,
                 deps = all_crate_deps(normal = True, normal_dev = True) + maybe_deps + deps_extra,
                 # Bazel has emitted both `codex-rs/<crate>/...` and
                 # `../codex-rs/<crate>/...` paths for `file!()`. Strip either
@@ -660,8 +662,8 @@ def codex_rust_crate(
             crate_name = test_crate_name,
             crate_root = test,
             srcs = [test],
-            data = native.glob(["tests/**"], allow_empty = True) + integration_test_binaries + integration_test_data_extra,
-            compile_data = native.glob(["tests/**"], allow_empty = True) + integration_compile_data_extra,
+            data = integration_test_files + integration_test_binaries + integration_test_data_extra,
+            compile_data = integration_test_files + integration_compile_data_extra,
             deps = all_crate_deps(normal = True, normal_dev = True) + maybe_deps + deps_extra,
             rustc_flags = rustc_flags_extra + WINDOWS_RUSTC_LINK_FLAGS + [
                 "--remap-path-prefix=../codex-rs=",

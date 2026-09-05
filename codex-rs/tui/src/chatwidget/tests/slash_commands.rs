@@ -113,7 +113,7 @@ fn next_copy_selection(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
 ) -> (String, String) {
     let selection = match rx.try_recv() {
-        Ok(AppEvent::CopySelection { text, label }) => (text.to_string(), label),
+        Ok(AppEvent::CopySelection { text, label, .. }) => (text.to_string(), label),
         other => panic!("expected selected clipboard content, got {other:?}"),
     };
     assert_matches!(rx.try_recv(), Ok(AppEvent::SettingsSelectionClosed));
@@ -823,8 +823,12 @@ async fn goal_control_slash_commands_emit_goal_events() {
         chat.set_feature_enabled(Feature::Goals, /*enabled*/ true);
         let thread_id = ThreadId::new();
         chat.thread_id = Some(thread_id);
+        chat.bottom_pane.set_vim_enabled(/*enabled*/ true);
 
-        submit_composer_text(&mut chat, command);
+        chat.bottom_pane
+            .set_composer_text(command.into(), Vec::new(), Vec::new());
+        chat.handle_key_event(KeyCode::Esc.into());
+        chat.handle_key_event(KeyCode::Enter.into());
 
         match status {
             Some(status) => {
@@ -850,6 +854,11 @@ async fn goal_control_slash_commands_emit_goal_events() {
                 assert_eq!(actual_thread_id, thread_id);
             }
         }
+        chat.handle_key_event(KeyCode::Char('x').into());
+        chat.handle_key_event(KeyCode::Right.into());
+        chat.handle_key_event(KeyCode::Esc.into());
+        chat.handle_key_event(KeyCode::Char('.').into());
+        assert_eq!(chat.bottom_pane.composer_text(), "xx");
     }
 }
 
@@ -1639,7 +1648,6 @@ async fn completed_token_activity_refresh_waits_for_active_hook() {
         ),
     );
 
-    assert_matches!(rx.try_recv(), Ok(AppEvent::InsertHistoryCell(_)));
     assert_matches!(rx.try_recv(), Ok(AppEvent::CommitPendingUsageOutput));
 }
 
@@ -2079,6 +2087,37 @@ async fn slash_copy_picker_numeric_shortcuts_copy_whole_response_and_exact_code(
             "rust code".to_string()
         )
     );
+}
+
+#[tokio::test]
+async fn slash_copy_picker_renders_only_whole_responses_as_markdown() {
+    use crate::clipboard_copy::CopyFormat;
+
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let markdown = "**Intro**\n\n```text\n# literal *code*\n```\n\n> **Quote**\n";
+    chat.transcript.last_agent_markdown = Some(markdown.to_string());
+    for (key, expected) in [
+        ('1', (markdown, "Whole response", CopyFormat::Markdown)),
+        (
+            '2',
+            ("# literal *code*\n", "text code", CopyFormat::PlainText),
+        ),
+        ('3', ("**Quote**\n", "Blockquote", CopyFormat::PlainText)),
+    ] {
+        chat.dispatch_command(SlashCommand::Copy);
+        chat.handle_key_event(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+        let event = rx.try_recv().expect("selected clipboard content");
+        let AppEvent::CopySelection {
+            text,
+            label,
+            format,
+        } = event
+        else {
+            panic!("expected selected clipboard content, got {event:?}");
+        };
+        assert_eq!((text.as_ref(), label.as_str(), format), expected);
+        assert_matches!(rx.try_recv(), Ok(AppEvent::SettingsSelectionClosed));
+    }
 }
 
 #[tokio::test]

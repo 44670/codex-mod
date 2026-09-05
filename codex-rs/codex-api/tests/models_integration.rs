@@ -102,12 +102,14 @@ async fn models_client_hits_models_endpoint() {
             used_fallback_model_metadata: false,
             supports_search_tool: false,
             use_responses_lite: false,
+            guardian: None,
             node_repl_auto_review_required: true,
             node_repl_disabled: true,
             auto_review_model_override: None,
             model_specialty: None,
             tool_mode: None,
             multi_agent_version: None,
+            multi_agent_reasoning_effort: None,
         }],
     };
 

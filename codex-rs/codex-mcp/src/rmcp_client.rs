@@ -60,6 +60,7 @@ use codex_protocol::protocol::McpStartupStatus;
 use codex_protocol::protocol::McpStartupUpdateEvent;
 use codex_rmcp_client::ExecutorStdioServerLauncher;
 use codex_rmcp_client::LocalStdioServerLauncher;
+use codex_rmcp_client::McpOAuthRefreshMode;
 use codex_rmcp_client::McpProtocolMode;
 use codex_rmcp_client::RmcpClient;
 use codex_rmcp_client::StdioServerLauncher;
@@ -283,6 +284,7 @@ struct ManagedClientStartup {
     server: EffectiveMcpServer,
     store_mode: OAuthCredentialsStoreMode,
     keyring_backend_kind: AuthKeyringBackendKind,
+    oauth_refresh_mode: McpOAuthRefreshMode,
     tx_event: Option<Sender<Event>>,
     elicitation_requests: ElicitationRequestManager,
     codex_apps_tools_cache_context: Option<ConnectorRuntimeContext<ToolInfo>>,
@@ -305,6 +307,7 @@ impl ManagedClientStartup {
             server,
             store_mode,
             keyring_backend_kind,
+            oauth_refresh_mode,
             tx_event,
             elicitation_requests,
             codex_apps_tools_cache_context,
@@ -342,6 +345,7 @@ impl ManagedClientStartup {
                         server.clone(),
                         store_mode,
                         keyring_backend_kind,
+                        oauth_refresh_mode,
                         runtime_context,
                         resolved_environment,
                         runtime_auth_provider,
@@ -358,7 +362,7 @@ impl ManagedClientStartup {
                     }
                 };
                 start_server_task(
-                    server_name,
+                    server_name.clone(),
                     client,
                     StartServerTaskParams {
                         is_codex_apps_mcp_server,
@@ -381,6 +385,10 @@ impl ManagedClientStartup {
                 Ok(result) => result,
                 Err(CancelErr::Cancelled) => Err(StartupOutcomeError::Cancelled),
             };
+            // Log once per startup attempt, including discovery without startup notifications.
+            if let Err(StartupOutcomeError::Failed { error, .. }) = &outcome {
+                warn!(server_name, %error, "MCP server startup failed");
+            }
             if outcome.is_ok()
                 && let Some(refresh_start) = refresh_start
             {
@@ -423,6 +431,7 @@ impl AsyncManagedClient {
         server: EffectiveMcpServer,
         store_mode: OAuthCredentialsStoreMode,
         keyring_backend_kind: AuthKeyringBackendKind,
+        oauth_refresh_mode: McpOAuthRefreshMode,
         cancel_token: CancellationToken,
         tx_event: Option<Sender<Event>>,
         elicitation_requests: ElicitationRequestManager,
@@ -452,6 +461,7 @@ impl AsyncManagedClient {
             server,
             store_mode,
             keyring_backend_kind,
+            oauth_refresh_mode,
             tx_event,
             elicitation_requests,
             codex_apps_tools_cache_context: codex_apps_tools_cache_context.clone(),
@@ -552,28 +562,32 @@ impl AsyncManagedClient {
                 .is_some_and(McpToolCatalogCacheContext::has_tools)
     }
 
-    fn cached_tools(&self) -> Option<Vec<ToolInfo>> {
+    pub(crate) fn cached_tools(&self) -> Option<Vec<ToolInfo>> {
+        self.cached_tools_or(/*fallback*/ None)
+    }
+
+    pub(crate) fn cached_tools_or(&self, fallback: Option<Vec<ToolInfo>>) -> Option<Vec<ToolInfo>> {
         self.codex_apps_tools_cache_context
             .as_ref()
             .and_then(ConnectorRuntimeContext::current_tools)
             .or_else(|| {
                 self.tool_catalog_cache_context
                     .as_ref()
-                    .and_then(McpToolCatalogCacheContext::current_tools)
+                    .and_then(|cache| cache.current_tools_or(fallback))
             })
     }
 
-    pub(crate) async fn listed_tools(&self) -> Option<Vec<ToolInfo>> {
+    pub(crate) async fn listed_tools(&self) -> Result<Vec<ToolInfo>, StartupOutcomeError> {
         // Plugin provenance is resolved per-session rather than stored in shared cache payloads.
         if !self.startup_complete.load(Ordering::Acquire)
             && let Some(startup_tools) = self.cached_tools()
         {
-            Some(startup_tools)
+            Ok(startup_tools)
         } else {
             match self.client().await {
-                Ok(client) => Some(client.listed_tools()),
-                Err(_) if self.is_codex_apps_mcp_server => self.cached_tools(),
-                Err(_) => None,
+                Ok(client) => Ok(client.listed_tools()),
+                Err(error) if self.is_codex_apps_mcp_server => self.cached_tools().ok_or(error),
+                Err(error) => Err(error),
             }
         }
     }
@@ -608,7 +622,7 @@ impl From<anyhow::Error> for StartupOutcomeError {
     fn from(error: anyhow::Error) -> Self {
         let is_authentication_required = is_authentication_required_error(&error);
         Self::Failed {
-            error: error.to_string(),
+            error: format!("{error:#}"),
             is_authentication_required,
         }
     }
@@ -856,7 +870,7 @@ fn resolve_bearer_token(
 }
 
 fn validate_mcp_server_name(server_name: &str) -> Result<()> {
-    let re = regex_lite::Regex::new(r"^[a-zA-Z0-9_-]+$")?;
+    let re = regex_lite::Regex::new(r"^[a-zA-Z0-9_:@/.-]+$")?;
     if !re.is_match(server_name) {
         return Err(anyhow!(
             "Invalid MCP server name '{server_name}': must match pattern {pattern}",
@@ -1003,7 +1017,7 @@ fn record_protocol_discovery_metrics(
     );
 }
 
-fn mcp_initialize_request_params(
+pub(crate) fn mcp_initialize_request_params(
     client_elicitation_capability: ElicitationCapability,
     client_mcp_extensions: ClientMcpExtensions,
 ) -> InitializeRequestParams {
@@ -1063,11 +1077,12 @@ struct StartServerTaskParams {
 
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "trace", skip_all, fields(server_name = %server_name))]
-async fn make_rmcp_client(
+pub(crate) async fn make_rmcp_client(
     server_name: &str,
     server: EffectiveMcpServer,
     store_mode: OAuthCredentialsStoreMode,
     keyring_backend_kind: AuthKeyringBackendKind,
+    oauth_refresh_mode: McpOAuthRefreshMode,
     runtime_context: McpRuntimeContext,
     resolved_environment: std::result::Result<Option<Arc<Environment>>, String>,
     runtime_auth_provider: Option<SharedAuthProvider>,
@@ -1195,6 +1210,7 @@ async fn make_rmcp_client(
                 runtime_auth_provider,
                 protocol_mode,
                 redirect_mode,
+                oauth_refresh_mode,
             )
             .await
             .map_err(StartupOutcomeError::from)

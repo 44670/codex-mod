@@ -24,6 +24,11 @@ fn transcript_v2_resolves_explicit_config_overrides() {
 }
 
 #[test]
+fn sleep_tool_config_rejects_unknown_mode() {
+    assert!(toml::from_str::<FeaturesToml>("[sleep_tool]\nmode = 'off'").is_err());
+}
+
+#[test]
 fn under_development_features_are_disabled_by_default() {
     for spec in crate::FEATURES {
         if matches!(spec.stage, Stage::UnderDevelopment) {
@@ -155,6 +160,44 @@ fn guardian_v2_feature_config_preserves_boolean_toggle() {
         features.entries(),
         BTreeMap::from([("guardianv2".to_owned(), true)])
     );
+}
+
+#[test]
+fn guardian_thread_context_resolves_boolean_config_and_profile_overrides() {
+    for (base, profile, enabled) in [
+        ("", "", false),
+        ("guardian_thread_context = false", "", false),
+        ("guardian_thread_context = true", "", true),
+        (
+            "guardian_thread_context = true",
+            "guardian_thread_context = false",
+            false,
+        ),
+        (
+            "guardian_thread_context = false",
+            "guardian_thread_context = true",
+            true,
+        ),
+    ] {
+        let base = toml::from_str::<FeaturesToml>(base).expect("base features");
+        let profile = toml::from_str::<FeaturesToml>(profile).expect("profile features");
+        let features = Features::from_sources(
+            FeatureConfigSource {
+                features: Some(&base),
+                ..Default::default()
+            },
+            FeatureConfigSource {
+                features: Some(&profile),
+                ..Default::default()
+            },
+            FeatureOverrides::default(),
+        );
+        let mut expected = Features::with_defaults();
+        if enabled {
+            expected.enable(Feature::GuardianThreadContext);
+        }
+        assert_eq!(features.enabled_features(), expected.enabled_features());
+    }
 }
 
 #[test]
