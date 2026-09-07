@@ -255,6 +255,21 @@ impl Session {
         }
     }
 
+    /// Refreshes Apps tools on the published thread runtime and returns that client's snapshot.
+    pub(crate) async fn refresh_codex_apps_tools(
+        self: &Arc<Self>,
+    ) -> anyhow::Result<codex_mcp::CodexAppsToolSnapshot> {
+        // Reconcile unchanged config so failed or closed clients can be replaced.
+        self.mark_mcp_runtime_dirty();
+        self.refresh_mcp_if_dirty().await;
+        let _refresh = self
+            .mcp_refresh
+            .acquire()
+            .await
+            .map_err(|_| anyhow::anyhow!("MCP runtime refresh semaphore closed"))?;
+        self.services.mcp_runtime.refresh_codex_apps_tools().await
+    }
+
     /// Reconnects the runtime so refreshed Apps tools belong to their new exact client.
     pub(crate) async fn hard_refresh_latest_codex_apps_tools(
         self: &Arc<Self>,
@@ -1008,7 +1023,9 @@ fn guardian_elicitation_review_request(
                 "guardian MCP elicitation review does not support this elicitation mode",
             );
         }
-        Elicitation::OpenAiForm { .. } | Elicitation::OpenAiElicitationForm { .. } => {
+        Elicitation::OpenAiForm { .. }
+        | Elicitation::OpenAiElicitationForm { .. }
+        | Elicitation::UserVerification { .. } => {
             return GuardianElicitationReview::NotRequested;
         }
     };

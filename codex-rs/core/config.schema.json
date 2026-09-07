@@ -774,9 +774,6 @@
             "guardian_reuse_parent_compaction": {
               "type": "boolean"
             },
-            "guardian_thread_context": {
-              "type": "boolean"
-            },
             "guardianv2": {
               "$ref": "#/definitions/FeatureToml_for_GuardianV2ConfigToml"
             },
@@ -880,6 +877,9 @@
               "type": "boolean"
             },
             "realtime_conversation": {
+              "type": "boolean"
+            },
+            "reasoning_effort_override": {
               "type": "boolean"
             },
             "recommended_plugins": {
@@ -1560,6 +1560,10 @@
           "maximum": 1.0,
           "minimum": 0.0,
           "type": "number"
+        },
+        "thread_context": {
+          "description": "Use thread-owned context for sync and async Guardian. Defaults to false. Independent of the Guardian v2 `enabled` toggle.",
+          "type": "boolean"
         },
         "transcript": {
           "$ref": "#/definitions/GuardianV2TranscriptConfigToml"
@@ -6165,9 +6169,6 @@
         "guardian_reuse_parent_compaction": {
           "type": "boolean"
         },
-        "guardian_thread_context": {
-          "type": "boolean"
-        },
         "guardianv2": {
           "$ref": "#/definitions/FeatureToml_for_GuardianV2ConfigToml"
         },
@@ -6271,6 +6272,9 @@
           "type": "boolean"
         },
         "realtime_conversation": {
+          "type": "boolean"
+        },
+        "reasoning_effort_override": {
           "type": "boolean"
         },
         "recommended_plugins": {

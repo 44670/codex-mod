@@ -127,6 +127,7 @@ impl ChatWidget {
             model_catalog,
             model_popup_request_id: None,
             permission_popup_request_id: None,
+            worktree_popup_request_id: None,
             permission_profiles_menu_opened: false,
             model_popup_model_ids: Vec::new(),
             session_telemetry,
@@ -135,6 +136,7 @@ impl ChatWidget {
             status_account_display,
             runtime_model_provider_base_url,
             remote_connection: None,
+            local_worktree_operations: true,
             token_info: None,
             token_usage_pending: false,
             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
@@ -216,6 +218,7 @@ impl ChatWidget {
             thread_rename_block_message: None,
             active_side_conversation: false,
             blocks_direct_input: false,
+            external_writer_view: false,
             misalignment_policy_violation: None,
             normal_placeholder_text: placeholder,
             side_placeholder_text: side_placeholder,
@@ -287,6 +290,7 @@ impl ChatWidget {
             .set_collaboration_modes_enabled(/*enabled*/ true);
         widget.sync_service_tier_commands();
         widget.sync_personality_command_enabled();
+        widget.sync_worktrees_enabled();
         widget.sync_plugins_command_enabled();
         widget.sync_goal_command_enabled();
         widget.sync_mentions_v2_enabled();
