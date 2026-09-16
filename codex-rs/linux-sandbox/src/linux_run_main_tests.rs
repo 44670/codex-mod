@@ -5,6 +5,8 @@ use crate::linux_run_main::install_bwrap_signal_forwarders;
 #[cfg(test)]
 use crate::linux_run_main::wait_for_bwrap_child;
 #[cfg(test)]
+use codex_network_proxy::ManagedNetworkSandboxContext;
+#[cfg(test)]
 use codex_protocol::models::PermissionProfile;
 #[cfg(test)]
 use codex_protocol::protocol::FileSystemSandboxPolicy;
@@ -201,6 +203,48 @@ fn inserts_unshare_net_when_proxy_only_network_mode_requested() {
     .expect("build bwrap argv")
     .args;
     assert!(argv.contains(&"--unshare-net".to_string()));
+}
+
+#[test]
+fn masks_wsl_interop_with_full_network_and_restricted_filesystem() {
+    let argv = build_bwrap_argv(
+        vec!["/bin/true".to_string()],
+        &read_only_file_system_policy(),
+        Path::new("/"),
+        Path::new("/"),
+        BwrapOptions {
+            network_mode: BwrapNetworkMode::FullAccess,
+            mask_wsl_interop: true,
+            ..Default::default()
+        },
+    )
+    .expect("build bwrap argv")
+    .args;
+
+    assert!(argv.windows(2).any(|args| args == ["--tmpfs", "/run/WSL"]));
+    assert!(!argv.iter().any(|arg| arg == "--unshare-net"));
+}
+
+#[test]
+fn masks_inherited_procfs_when_wsl_interop_is_masked_without_fresh_proc() {
+    let argv = build_bwrap_argv(
+        vec!["/bin/true".to_string()],
+        &read_only_file_system_policy(),
+        Path::new("/"),
+        Path::new("/"),
+        BwrapOptions {
+            mount_proc: false,
+            network_mode: BwrapNetworkMode::FullAccess,
+            mask_wsl_interop: true,
+            ..Default::default()
+        },
+    )
+    .expect("build bwrap argv")
+    .args;
+
+    assert!(argv.windows(2).any(|args| args == ["--tmpfs", "/run/WSL"]));
+    assert!(argv.windows(2).any(|args| args == ["--tmpfs", "/proc"]));
+    assert!(!argv.windows(2).any(|args| args == ["--proc", "/proc"]));
 }
 
 #[test]
@@ -511,17 +555,63 @@ fn run_bwrap_signal_forwarder_test_supervisor() -> ! {
 #[test]
 fn managed_proxy_inner_command_includes_route_spec() {
     let permission_profile = read_only_permission_profile();
-    let args = build_inner_seccomp_command(InnerSeccompCommandArgs {
-        sandbox_policy_cwd: Path::new("/tmp"),
-        command_cwd: Some(Path::new("/tmp/link")),
-        permission_profile: &permission_profile,
-        allow_network_for_proxy: true,
-        proxy_route_spec: Some("{\"routes\":[]}".to_string()),
-        command: vec!["/bin/true".to_string()],
-    });
+    for managed_network in [
+        ManagedNetworkSandboxContext::default(),
+        ManagedNetworkSandboxContext {
+            loopback_ports: vec![8080, 9090],
+            allow_local_binding: true,
+            allow_unix_sockets: vec!["/tmp/daemon.sock".to_string()],
+            dangerously_allow_all_unix_sockets: true,
+        },
+    ] {
+        let args = build_inner_seccomp_command(InnerSeccompCommandArgs {
+            sandbox_policy_cwd: Path::new("/tmp"),
+            command_cwd: Some(Path::new("/tmp/link")),
+            permission_profile: &permission_profile,
+            managed_network: Some(managed_network.clone()),
+            proxy_route_spec: Some("{\"routes\":[]}".to_string()),
+            command: vec!["/bin/true".to_string()],
+        });
 
-    assert!(args.iter().any(|arg| arg == "--proxy-route-spec"));
-    assert!(args.iter().any(|arg| arg == "{\"routes\":[]}"));
+        assert!(args.iter().any(|arg| arg == "--proxy-route-spec"));
+        assert!(args.iter().any(|arg| arg == "{\"routes\":[]}"));
+        let parsed = LandlockCommand::try_parse_from(args)
+            .expect("inner command should preserve the managed network policy");
+        assert_eq!(parsed.managed_network, Some(managed_network));
+    }
+}
+
+#[test]
+fn managed_network_policy_alone_enables_proxy_mode() {
+    let parsed = LandlockCommand::try_parse_from([
+        "codex-linux-sandbox",
+        "--sandbox-policy-cwd",
+        "/tmp",
+        "--managed-network",
+        "{}",
+        "--",
+        "/bin/true",
+    ])
+    .expect("managed network context should enable proxy mode on its own");
+    assert_eq!(
+        parsed.managed_network,
+        Some(ManagedNetworkSandboxContext::default())
+    );
+}
+
+#[test]
+fn malformed_managed_network_policy_is_rejected() {
+    let error = LandlockCommand::try_parse_from([
+        "codex-linux-sandbox",
+        "--sandbox-policy-cwd",
+        "/tmp",
+        "--managed-network",
+        "{\"dangerouslyAllowAllUnixSockets\":\"true\"}",
+        "--",
+        "/bin/true",
+    ])
+    .expect_err("managed network policy should reject a non-boolean grant");
+    assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
 }
 
 #[test]
@@ -531,7 +621,7 @@ fn inner_command_includes_permission_profile_flag() {
         sandbox_policy_cwd: Path::new("/tmp"),
         command_cwd: Some(Path::new("/tmp/link")),
         permission_profile: &permission_profile,
-        allow_network_for_proxy: false,
+        managed_network: None,
         proxy_route_spec: None,
         command: vec!["/bin/true".to_string()],
     });
@@ -550,12 +640,15 @@ fn non_managed_inner_command_omits_route_spec() {
         sandbox_policy_cwd: Path::new("/tmp"),
         command_cwd: Some(Path::new("/tmp/link")),
         permission_profile: &permission_profile,
-        allow_network_for_proxy: false,
+        managed_network: None,
         proxy_route_spec: None,
         command: vec!["/bin/true".to_string()],
     });
 
     assert!(!args.iter().any(|arg| arg == "--proxy-route-spec"));
+    let parsed = LandlockCommand::try_parse_from(args)
+        .expect("unmanaged inner command should preserve ordinary sandbox mode");
+    assert_eq!(parsed.managed_network, None);
 }
 
 #[test]
@@ -566,7 +659,7 @@ fn managed_proxy_inner_command_requires_route_spec() {
             sandbox_policy_cwd: Path::new("/tmp"),
             command_cwd: Some(Path::new("/tmp/link")),
             permission_profile: &permission_profile,
-            allow_network_for_proxy: true,
+            managed_network: Some(ManagedNetworkSandboxContext::default()),
             proxy_route_spec: None,
             command: vec!["/bin/true".to_string()],
         })
@@ -673,11 +766,42 @@ fn legacy_landlock_rejects_split_only_filesystem_policies() {
             /*use_legacy_landlock*/ true,
             &policy,
             NetworkSandboxPolicy::Restricted,
+            /*allow_network_for_proxy*/ false,
             temp_dir.path(),
+            &temp_dir.path().join("WSL"),
         );
     });
 
     assert!(result.is_err());
+}
+
+#[test]
+fn legacy_landlock_rejects_full_network_when_wsl_interop_is_available() {
+    let temp_dir = tempfile::TempDir::new().expect("tempdir");
+    let wsl_interop_dir = temp_dir.path().join("WSL");
+    std::fs::create_dir(&wsl_interop_dir).expect("create interop directory");
+    let policy = read_only_file_system_policy();
+
+    let result = std::panic::catch_unwind(|| {
+        ensure_legacy_landlock_mode_supports_policy(
+            /*use_legacy_landlock*/ true,
+            &policy,
+            NetworkSandboxPolicy::Enabled,
+            /*allow_network_for_proxy*/ false,
+            temp_dir.path(),
+            &wsl_interop_dir,
+        );
+    });
+    assert!(result.is_err());
+
+    ensure_legacy_landlock_mode_supports_policy(
+        /*use_legacy_landlock*/ true,
+        &policy,
+        NetworkSandboxPolicy::Enabled,
+        /*allow_network_for_proxy*/ true,
+        temp_dir.path(),
+        &wsl_interop_dir,
+    );
 }
 
 #[test]

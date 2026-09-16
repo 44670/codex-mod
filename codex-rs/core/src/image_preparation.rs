@@ -15,6 +15,7 @@ use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_utils_image::ImageProcessingError;
@@ -178,6 +179,8 @@ fn prepare_message_content(
     metadata: &mut Vec<ImagePreparationMetadata>,
     mode: ImagePreparationMode,
 ) -> Vec<ResizedImage> {
+    // TODO(kc) Prepare file-backed images once Core has an explicit resolution contract. Until
+    // then they pass through while retaining their positions in resize notices.
     let image_count = items
         .iter()
         .filter(|item| matches!(item.content(), ContentItem::InputImage { .. }))
@@ -185,8 +188,14 @@ fn prepare_message_content(
     let mut image_number = 0;
     let mut resized_images = Vec::new();
     for item in items {
-        if let ContentItem::InputImage { image_url, detail } = item.content_mut() {
+        if matches!(item.content(), ContentItem::InputImage { .. }) {
             image_number += 1;
+        }
+        if let ContentItem::InputImage {
+            image: ImageReference::Inline { image_url },
+            detail,
+        } = item.content_mut()
+        {
             match prepare_image(image_url, detail, origin, metadata, mode) {
                 Ok(Some(resize)) if resize_notice_mode == ImageResizeNoticeMode::Enabled => {
                     resized_images.push(ResizedImage {
@@ -226,8 +235,14 @@ fn prepare_tool_output_content(
     let mut image_number = 0;
     let mut resized_images = Vec::new();
     for item in items {
-        if let FunctionCallOutputContentItem::InputImage { image_url, detail } = item {
+        if matches!(item, FunctionCallOutputContentItem::InputImage { .. }) {
             image_number += 1;
+        }
+        if let FunctionCallOutputContentItem::InputImage {
+            image: ImageReference::Inline { image_url },
+            detail,
+        } = item
+        {
             match prepare_image(image_url, detail, origin, metadata, mode) {
                 Ok(Some(resize)) if resize_notice_mode == ImageResizeNoticeMode::Enabled => {
                     resized_images.push(ResizedImage {

@@ -69,8 +69,12 @@ mod input_boundary;
 #[cfg(unix)]
 mod job_control;
 mod keyboard_modes;
+#[cfg(all(test, unix))]
+#[path = "tui_panic_tests.rs"]
+mod panic_tests;
 mod screen_size;
 mod scrollback;
+mod size_monitor;
 #[cfg(all(test, unix))]
 #[path = "tui_startup_tests.rs"]
 mod startup_tests;
@@ -602,7 +606,7 @@ pub struct Tui {
     notification_backend: Option<DesktopNotificationBackend>,
     notification_condition: NotificationCondition,
     scrollback: ScrollbackStrategy,
-    // When false, enter_alt_screen() becomes a no-op.
+    // When false, overlays stay on the inline screen.
     alt_screen_enabled: bool,
     // Keeps unmanaged process stderr writes out of the inline viewport.
     _stderr_guard: terminal_stderr::TerminalStderrGuard,
@@ -637,12 +641,19 @@ impl Tui {
         // Cache this to avoid contention with the event reader.
         supports_color::on_cached(supports_color::Stream::Stdout);
         let _ = crate::terminal_palette::default_colors();
-        let scrollback = ScrollbackStrategy::detect(&codex_terminal_detection::terminal_info());
+        let terminal_info = codex_terminal_detection::terminal_info();
+        let scrollback = ScrollbackStrategy::detect(&terminal_info);
+        let mut event_broker = EventBroker::new();
+        event_broker.size_monitor = size_monitor::SizeMonitor::start(
+            &terminal_info,
+            terminal.last_known_screen_size,
+            draw_tx.clone(),
+        );
 
         Self {
             frame_requester,
             draw_tx,
-            event_broker: Arc::new(EventBroker::new()),
+            event_broker: Arc::new(event_broker),
             terminal,
             pending_history_lines: vec![],
             screen_size: ScreenSizePolicy::default(),
@@ -662,7 +673,7 @@ impl Tui {
         }
     }
 
-    /// Set whether alternate screen is enabled. When false, enter_alt_screen() becomes a no-op.
+    /// Set whether overlays switch to the alternate screen or stay inline.
     pub fn set_alt_screen_enabled(&mut self, enabled: bool) {
         self.alt_screen_enabled = enabled;
     }
@@ -716,6 +727,7 @@ impl Tui {
     pub(crate) fn recover_after_caught_panic(&mut self) -> Result<()> {
         set_modes()?;
         self._stderr_guard.recover_after_caught_panic()?;
+        self.terminal.invalidate_cursor_state();
         self.terminal.invalidate_viewport();
         self.frame_requester().schedule_frame();
         Ok(())
@@ -768,6 +780,7 @@ impl Tui {
         if let Err(err) = set_modes() {
             tracing::warn!("failed to re-enable terminal modes after external program: {err}");
         }
+        self.terminal.invalidate_cursor_state();
         // After the external program `f` finishes, reset terminal state and flush any buffered keypresses.
         flush_terminal_input_buffer();
 
@@ -829,10 +842,23 @@ impl Tui {
     /// Enter alternate screen and expand the viewport to full terminal size, saving the current
     /// inline viewport for restoration when leaving.
     pub fn enter_alt_screen(&mut self) -> Result<()> {
+        if self.is_alt_screen_active() {
+            return Ok(());
+        }
+        // History queued before opening an overlay belongs to the inline transcript.
+        // Flush before switching screens or expanding an inline overlay's viewport.
+        let screen_size = self.terminal.last_known_screen_size;
+        Self::flush_pending_history_lines(
+            &mut self.terminal,
+            &mut self.pending_history_lines,
+            self.scrollback,
+            screen_size,
+        )?;
         if !self.alt_screen_enabled {
             return Ok(());
         }
         let _ = execute!(self.terminal.backend_mut(), EnterAlternateScreen);
+        self.terminal.invalidate_cursor_state();
         // Enable "alternate scroll" so terminals may translate wheel to arrows
         let _ = execute!(self.terminal.backend_mut(), EnableAlternateScroll);
         if let Ok(size) = self.terminal.size() {
@@ -858,6 +884,7 @@ impl Tui {
         // Disable alternate scroll when leaving alt-screen
         let _ = execute!(self.terminal.backend_mut(), DisableAlternateScroll);
         let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        self.terminal.invalidate_cursor_state();
         if let Some(saved) = self.alt_saved_viewport.take() {
             self.terminal.set_viewport_area(saved);
         }
@@ -994,6 +1021,7 @@ impl Tui {
         stdout().sync_update(|_| {
             #[cfg(unix)]
             if let Some(prepared) = prepared_resume.take() {
+                self.terminal.invalidate_cursor_state();
                 prepared.apply(&mut self.terminal, screen_size)?;
             }
 
@@ -1129,6 +1157,7 @@ impl Tui {
         stdout().sync_update(|_| {
             #[cfg(unix)]
             if let Some(prepared) = prepared_resume.take() {
+                self.terminal.invalidate_cursor_state();
                 prepared.apply(&mut self.terminal, screen_size)?;
             }
 

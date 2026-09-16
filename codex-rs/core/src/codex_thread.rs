@@ -29,6 +29,7 @@ use codex_protocol::mcp::CallToolResult;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::ProfileWorkspaceRoot;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
@@ -91,7 +92,7 @@ pub struct ThreadConfigSnapshot {
     pub active_permission_profile: Option<ActivePermissionProfile>,
     pub environments: TurnEnvironmentSelections,
     pub workspace_roots: Vec<AbsolutePathBuf>,
-    pub profile_workspace_roots: Vec<AbsolutePathBuf>,
+    pub profile_workspace_roots: Vec<ProfileWorkspaceRoot>,
     pub ephemeral: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub reasoning_summary: Option<ReasoningSummary>,
@@ -103,6 +104,7 @@ pub struct ThreadConfigSnapshot {
     pub parent_thread_id: Option<ThreadId>,
     pub thread_source: Option<ThreadSource>,
     pub originator: String,
+    pub disabled_plugin_ids: Vec<String>,
 }
 
 impl ThreadConfigSnapshot {
@@ -138,7 +140,8 @@ impl ThreadConfigSnapshot {
 #[derive(Clone, Default)]
 pub struct CodexThreadSettingsOverrides {
     pub environments: Option<TurnEnvironmentSelections>,
-    pub profile_workspace_roots: Option<Vec<AbsolutePathBuf>>,
+    pub runtime_workspace_roots: Option<Vec<AbsolutePathBuf>>,
+    pub profile_workspace_roots: Option<Vec<ProfileWorkspaceRoot>>,
     pub approval_policy: Option<AskForApproval>,
     pub approvals_reviewer: Option<ApprovalsReviewer>,
     pub sandbox_policy: Option<SandboxPolicy>,
@@ -151,6 +154,7 @@ pub struct CodexThreadSettingsOverrides {
     pub service_tier: Option<Option<String>>,
     pub collaboration_mode: Option<CollaborationMode>,
     pub personality: Option<Personality>,
+    pub disabled_plugin_ids: Option<Vec<String>>,
 }
 
 pub use codex_guardian_context::GuardianRootMessage;
@@ -177,6 +181,8 @@ pub struct GuardianRootSnapshot {
 pub struct CodexThread {
     pub(crate) session: Arc<Session>,
     pub(crate) io: SessionIo,
+    // Registration source controls live access and lifecycle hooks. Managed Guardian
+    // reviewers keep their existing subagent identity inside the session.
     pub(crate) session_source: SessionSource,
     session_configured: SessionConfiguredEvent,
     rollout_path: Option<PathBuf>,
@@ -228,6 +234,11 @@ impl CodexThread {
         self.session.services.session_telemetry.clone()
     }
 
+    /// Whether analytics is enabled for this thread after configuration and host overrides.
+    pub fn analytics_enabled(&self) -> bool {
+        self.session.services.analytics_events_client.is_enabled()
+    }
+
     /// Returns extension-owned data attached to this thread runtime.
     pub fn thread_extension_data(&self) -> &codex_extension_api::ExtensionData {
         &self.session.services.thread_extension_data
@@ -243,13 +254,18 @@ impl CodexThread {
     }
 
     pub(crate) async fn emit_thread_ready_lifecycle(&self) {
-        let config = self.config().await;
-        for contributor in self
+        let contributors = self
             .session
             .services
             .extensions
-            .thread_lifecycle_contributors()
-        {
+            .thread_lifecycle_contributors();
+        // Hook-free reviewers must reach their owner without suspending after registration.
+        // Otherwise cancellation can strand the registered thread before cleanup is installed.
+        if contributors.is_empty() {
+            return;
+        }
+        let config = self.config().await;
+        for contributor in contributors {
             contributor
                 .on_thread_ready(codex_extension_api::ThreadReadyInput {
                     config: config.as_ref(),
@@ -340,6 +356,23 @@ impl CodexThread {
                 unreachable!("start-if-idle submission cannot steer")
             }
         }
+    }
+
+    /// Starts a new internal continuation turn when idle, including in Plan mode.
+    /// Rejects if a newer task has started, even if it has already finished.
+    /// The input must be a response item; it is never treated as user authorization.
+    pub async fn continue_turn_if_idle(
+        &self,
+        request: TurnInputRequest,
+        expected_previous_turn_id: String,
+    ) -> CodexResult<TurnInputSubmission> {
+        self.submit_turn_input_with_mode(
+            request,
+            TurnInputMode::ContinueIfIdle {
+                expected_previous_turn_id,
+            },
+        )
+        .await
     }
 
     /// Resumes an interrupted regular turn only when the thread is idle.
@@ -482,6 +515,13 @@ impl CodexThread {
         self.session.inject_if_running(items).await
     }
 
+    /// Captures a regular turn only after its input is recorded. The caller must flush the rollout.
+    pub async fn interrupted_turn(
+        &self,
+    ) -> Option<(String, TurnStartOptions, TurnEnvironmentSelection)> {
+        self.session.interrupted_turn().await
+    }
+
     /// Returns the trusted root when the expected turn is currently active.
     pub async fn active_turn_root(&self, expected_turn_id: &str) -> Option<String> {
         let active = self.session.active_turn.lock().await;
@@ -528,9 +568,17 @@ impl CodexThread {
         self.session.update_settings(updates).await.map(|_| ())
     }
 
+    /// Persists current settings without emitting a live settings event.
+    ///
+    /// Serializes snapshot capture and persistence with accepted settings updates.
+    pub async fn checkpoint_thread_settings(&self) -> ThreadStoreResult<()> {
+        self.session.checkpoint_thread_settings().await
+    }
+
     fn thread_settings_update(overrides: CodexThreadSettingsOverrides) -> SessionSettingsUpdate {
         let CodexThreadSettingsOverrides {
             environments,
+            runtime_workspace_roots,
             profile_workspace_roots,
             approval_policy,
             approvals_reviewer,
@@ -544,6 +592,7 @@ impl CodexThread {
             service_tier,
             collaboration_mode,
             personality,
+            disabled_plugin_ids,
         } = overrides;
         SessionSettingsUpdate {
             step_settings: StepSettingsUpdate {
@@ -557,17 +606,27 @@ impl CodexThread {
                 approvals_reviewer,
             },
             environments,
+            runtime_workspace_roots,
             profile_workspace_roots,
             sandbox_policy,
             permission_profile,
             active_permission_profile,
             windows_sandbox_level,
+            disabled_plugin_ids,
             ..Default::default()
         }
     }
 
     pub async fn next_event(&self) -> CodexResult<Event> {
         self.io.next_event().await
+    }
+
+    /// Returns the event count for a finite drain before transferring the receiver.
+    ///
+    /// The caller must own the only event reader until it consumes this many events.
+    /// Events queued after this snapshot remain for the next reader.
+    pub fn queued_event_count(&self) -> usize {
+        self.io.rx_event.len()
     }
 
     pub async fn agent_status(&self) -> AgentStatus {
@@ -658,8 +717,10 @@ impl CodexThread {
 
     pub async fn guardian_trunk_rollout_path(&self) -> Option<PathBuf> {
         self.session
-            .guardian_review_session
-            .trunk_rollout_path()
+            .guardian_review_session()?
+            .trunk()
+            .await?
+            .rollout_path()
             .await
     }
 

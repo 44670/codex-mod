@@ -57,6 +57,7 @@ static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod app_cmd;
 mod cloud_config;
+mod daemon_install;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod desktop_app;
 mod doctor;
@@ -67,6 +68,7 @@ mod exec_server_auth;
 mod exec_server_telemetry;
 mod marketplace_cmd;
 mod mcp_cmd;
+mod mcp_login;
 mod migrate_rollouts;
 mod plugin_cmd;
 mod queue_cmd;
@@ -577,6 +579,10 @@ struct AppServerCommand {
     #[arg(long = "remote-control", hide = true)]
     remote_control: bool,
 
+    /// Save loaded threads during managed daemon shutdown.
+    #[arg(long, hide = true)]
+    managed_daemon: bool,
+
     /// Controls whether analytics are enabled by default.
     ///
     /// Analytics are disabled by default for app-server. Users have to explicitly opt in
@@ -787,6 +793,16 @@ enum AppServerDaemonSubcommand {
     /// Restart the local app server daemon.
     Restart,
 
+    /// Update the daemon package (may interrupt running work).
+    Update {
+        /// Copy and pin this CLI package.
+        #[arg(long)]
+        from_cli: bool,
+        /// Confirm replacing the daemon package without an interactive prompt.
+        #[arg(short = 'y', long, requires = "from_cli")]
+        yes: bool,
+    },
+
     /// Enable remote control for future starts and a currently running managed daemon.
     EnableRemoteControl,
 
@@ -801,7 +817,14 @@ enum AppServerDaemonSubcommand {
 
     /// [internal] Run the detached pid-backed standalone updater loop.
     #[clap(hide = true)]
-    PidUpdateLoop,
+    PidUpdateLoop {
+        /// Check support for daemon-owned packages without starting the updater.
+        #[arg(long, hide = true)]
+        check_package_ownership: bool,
+        /// Authorize one production restoration of this selected release.
+        #[arg(long, hide = true)]
+        restore_release: Option<String>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -864,7 +887,10 @@ fn parse_socket_path(raw: &str) -> Result<AbsolutePathBuf, String> {
 }
 
 /// Handle the app exit and print the results. Optionally run the update action.
-fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
+fn handle_app_exit(
+    exit_info: AppExitInfo,
+    cli_executable: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
     let is_fatal = match &exit_info.exit_reason {
         ExitReason::Fatal(message) => {
             eprintln!("ERROR: {message}");
@@ -877,22 +903,41 @@ fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
     };
 
     let update_action = exit_info.update_action;
-    let color_enabled = supports_color::on(Stream::Stdout).is_some();
-    for line in exit_info.format_exit_messages(color_enabled) {
-        println!("{line}");
+    if !matches!(update_action, Some(UpdateAction::Daemon(_))) {
+        let color_enabled = supports_color::on(Stream::Stdout).is_some();
+        for line in exit_info.format_exit_messages(color_enabled) {
+            println!("{line}");
+        }
     }
     if is_fatal {
         std::io::stdout().flush()?;
         std::process::exit(1);
     }
     if let Some(action) = update_action {
-        run_update_action(action)?;
+        run_update_action(action, cli_executable)?;
     }
     Ok(())
 }
 
 /// Run the update action and print the result.
-fn run_update_action(action: UpdateAction) -> anyhow::Result<()> {
+fn run_update_action(
+    action: UpdateAction,
+    cli_executable: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    if let UpdateAction::Daemon(source) = action {
+        let executable = cli_executable
+            .ok_or_else(|| anyhow::anyhow!("Cannot locate the launching Codex CLI"))?;
+        println!("Updating the local background server...");
+        let status = std::process::Command::new(executable)
+            .args(source.command_args())
+            .status()?;
+        anyhow::ensure!(
+            status.success(),
+            "Daemon update failed with status {status}"
+        );
+        println!("Relaunch Codex to reconnect.");
+        return Ok(());
+    }
     println!();
     let cmd_str = action.command_str();
     println!("Updating Codex via `{cmd_str}`...");
@@ -973,7 +1018,7 @@ fn run_update_command() -> anyhow::Result<()> {
                 "Could not detect the Codex installation method. Please update manually: https://developers.openai.com/codex/cli/"
             );
         };
-        run_update_action(action)
+        run_update_action(action, /*cli_executable*/ None)
     }
 }
 
@@ -1135,6 +1180,14 @@ async fn cli_main(
         mut interactive,
         subcommand,
     } = MultitoolCli::parse();
+    // Retain the launch target through TUI exit, even if a launcher changes selection.
+    let daemon_cli_executable = arg0_paths
+        .codex_self_exe
+        .as_ref()
+        .and_then(|path| path.canonicalize().ok());
+    interactive.daemon_cli_executable = daemon_cli_executable
+        .clone()
+        .and_then(|path| AbsolutePathBuf::from_absolute_path(path).ok());
     reject_unsupported_worktree_for_subcommand(interactive.shared.worktree, &subcommand)?;
     // Fold --enable/--disable into config overrides so they flow to all subcommands.
     let toggle_overrides = feature_toggles.to_overrides()?;
@@ -1221,7 +1274,7 @@ async fn cli_main(
                 arg0_paths.clone(),
             )
             .await?;
-            handle_app_exit(exit_info)?;
+            handle_app_exit(exit_info, daemon_cli_executable.as_deref())?;
         }
         Some(Subcommand::Exec(mut exec_cli)) => {
             reject_remote_mode_for_subcommand(
@@ -1316,6 +1369,7 @@ async fn cli_main(
                 listen,
                 stdio,
                 remote_control,
+                managed_daemon,
                 analytics_default_enabled,
                 auth,
             } = app_server_cli;
@@ -1336,6 +1390,7 @@ async fn cli_main(
                     let auth = auth.try_into_settings()?;
                     let runtime_options = codex_app_server::AppServerRuntimeOptions {
                         code_mode_host_transport: code_mode_host.into(),
+                        managed_daemon,
                         remote_control_startup_mode: match (remote_control, remote_control_disabled)
                         {
                             (true, _) => {
@@ -1350,7 +1405,7 @@ async fn cli_main(
                         },
                         ..Default::default()
                     };
-                    codex_app_server::run_main_with_transport_options(
+                    let exit = codex_app_server::run_main_with_transport_options(
                         arg0_paths.clone(),
                         root_config_overrides,
                         LoaderOverrides::default(),
@@ -1362,6 +1417,10 @@ async fn cli_main(
                         runtime_options,
                     )
                     .await?;
+                    if exit == codex_app_server::AppServerExit::Forced {
+                        // Runtime teardown can wait forever for blocked rollout I/O.
+                        std::process::exit(0);
+                    }
                 }
                 Some(AppServerSubcommand::Daemon(daemon_cli)) => match daemon_cli.subcommand {
                     AppServerDaemonSubcommand::Start => {
@@ -1377,6 +1436,18 @@ async fn cli_main(
                     }
                     AppServerDaemonSubcommand::Restart => {
                         print_app_server_daemon_output(AppServerLifecycleCommand::Restart).await?;
+                    }
+                    AppServerDaemonSubcommand::Update {
+                        from_cli: true,
+                        yes,
+                    } => {
+                        if let Some(output) = codex_app_server_daemon::update_from_cli(|request| {
+                            daemon_install::confirm_install(request, yes)
+                        })
+                        .await?
+                        {
+                            println!("{}", serde_json::to_string(&output)?);
+                        }
                     }
                     AppServerDaemonSubcommand::EnableRemoteControl => {
                         print_app_server_remote_control_output(AppServerRemoteControlMode::Enabled)
@@ -1394,7 +1465,17 @@ async fn cli_main(
                     AppServerDaemonSubcommand::Version => {
                         print_app_server_daemon_output(AppServerLifecycleCommand::Version).await?;
                     }
-                    AppServerDaemonSubcommand::PidUpdateLoop => {
+                    AppServerDaemonSubcommand::PidUpdateLoop {
+                        check_package_ownership: true,
+                        ..
+                    } => return Ok(()),
+                    AppServerDaemonSubcommand::Update {
+                        from_cli: false, ..
+                    }
+                    | AppServerDaemonSubcommand::PidUpdateLoop {
+                        check_package_ownership: false,
+                        ..
+                    } => {
                         let cli_overrides = root_config_overrides
                             .parse_overrides()
                             .map_err(anyhow::Error::msg)?;
@@ -1404,7 +1485,26 @@ async fn cli_main(
                             .await
                             .map_err(anyhow::Error::from);
                         let http_client_factory = updater_http_client_factory(config);
-                        codex_app_server_daemon::run_pid_update_loop(http_client_factory).await?;
+                        if matches!(
+                            daemon_cli.subcommand,
+                            AppServerDaemonSubcommand::Update { .. }
+                        ) {
+                            let output =
+                                codex_app_server_daemon::update(http_client_factory).await?;
+                            println!("{}", serde_json::to_string(&output)?);
+                        } else {
+                            let AppServerDaemonSubcommand::PidUpdateLoop {
+                                restore_release, ..
+                            } = daemon_cli.subcommand
+                            else {
+                                unreachable!()
+                            };
+                            codex_app_server_daemon::run_pid_update_loop(
+                                http_client_factory,
+                                restore_release,
+                            )
+                            .await?;
+                        }
                     }
                 },
                 Some(AppServerSubcommand::Proxy(proxy_cli)) => {
@@ -1489,7 +1589,7 @@ async fn cli_main(
                 arg0_paths.clone(),
             )
             .await?;
-            handle_app_exit(exit_info)?;
+            handle_app_exit(exit_info, daemon_cli_executable.as_deref())?;
         }
         Some(Subcommand::Archive(cmd)) => {
             let output = run_session_archive_cli_command(
@@ -1576,7 +1676,7 @@ async fn cli_main(
                 arg0_paths.clone(),
             )
             .await?;
-            handle_app_exit(exit_info)?;
+            handle_app_exit(exit_info, daemon_cli_executable.as_deref())?;
         }
         Some(Subcommand::Login(mut login_cli)) => {
             reject_remote_mode_for_subcommand(
@@ -2616,6 +2716,7 @@ fn app_server_subcommand_name(subcommand: Option<&AppServerSubcommand>) -> &'sta
             AppServerDaemonSubcommand::Bootstrap(_) => "app-server daemon bootstrap",
             AppServerDaemonSubcommand::Start => "app-server daemon start",
             AppServerDaemonSubcommand::Restart => "app-server daemon restart",
+            AppServerDaemonSubcommand::Update { .. } => "app-server daemon update",
             AppServerDaemonSubcommand::EnableRemoteControl => {
                 "app-server daemon enable-remote-control"
             }
@@ -2624,7 +2725,7 @@ fn app_server_subcommand_name(subcommand: Option<&AppServerSubcommand>) -> &'sta
             }
             AppServerDaemonSubcommand::Stop => "app-server daemon stop",
             AppServerDaemonSubcommand::Version => "app-server daemon version",
-            AppServerDaemonSubcommand::PidUpdateLoop => "app-server daemon pid-update-loop",
+            AppServerDaemonSubcommand::PidUpdateLoop { .. } => "app-server daemon pid-update-loop",
         },
         Some(AppServerSubcommand::Proxy(_)) => "app-server proxy",
         Some(AppServerSubcommand::GenerateTs(_)) => "app-server generate-ts",
@@ -5146,3 +5247,7 @@ mod tests {
             .expect_err("feature should be rejected")
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "daemon_update_tests.rs"]
+mod daemon_update_tests;

@@ -1,7 +1,7 @@
 //! Reviews terminal input against retained launch permissions and current policy.
 //! Permission snapshots stay host-owned; neither an earlier approval nor a policy
 //! change alters the sandbox of an already-running process. Native launches keep
-//! their configured Windows sandbox level; executor launches use executor defaults.
+//! their configured Windows sandbox selection; executor launches use executor defaults.
 
 use super::ProcessEntry;
 use super::UnifiedExecContext;
@@ -56,7 +56,7 @@ impl TerminalPolicy {
         if matches!(sandbox_source, TerminalSandboxSource::Native) {
             // The filesystem helper applies executor defaults, but native process
             // launches honor Disabled. Preserve it so later enablement is detected.
-            sandbox.windows_sandbox_level = environment.config().windows_sandbox_level;
+            sandbox.windows_sandbox_selection = environment.config().windows_sandbox_level.into();
         }
         Self {
             sandbox,
@@ -160,7 +160,7 @@ impl TerminalPermissions {
         };
         let mut reason = format!("Send input to an existing terminal. {authority}");
         if self.internal_permissions.is_some() {
-            reason.push_str(" It also has an internal plugin metrics write grant.");
+            reason.push_str(" It also has an internal filesystem grant.");
         }
         reason.push_str(" The cwd is its launch directory; the terminal's current directory and state may have changed.");
         if let Some(grants) = &self.additional_permissions {

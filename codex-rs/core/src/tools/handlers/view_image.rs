@@ -7,6 +7,7 @@ use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::openai_models::InputModality;
 use codex_utils_image::data_url_from_bytes;
@@ -95,8 +96,9 @@ impl ViewImageHandler {
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         if !invocation
-            .turn
-            .model_info()
+            .step_context
+            .settings
+            .model_info
             .input_modalities
             .contains(&InputModality::Image)
         {
@@ -185,7 +187,8 @@ impl ViewImageHandler {
             FunctionCallError::RespondToModel(VIEW_IMAGE_INVALID_MESSAGE.to_string())
         })?;
 
-        let can_request_original_detail = can_request_original_image_detail(turn.model_info());
+        let can_request_original_detail =
+            can_request_original_image_detail(&step_context.settings.model_info);
         let use_original_detail = self.options.unified_image_budget
             || can_request_original_detail && matches!(detail, Some(ViewImageDetail::Original));
         let image_detail = if use_original_detail {
@@ -236,7 +239,9 @@ impl ToolOutput for ViewImageOutput {
     fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInputItem {
         let body =
             FunctionCallOutputBody::ContentItems(vec![FunctionCallOutputContentItem::InputImage {
-                image_url: self.image_url.clone(),
+                image: ImageReference::Inline {
+                    image_url: self.image_url.clone(),
+                },
                 detail: Some(self.image_detail),
             }]);
         let output = FunctionCallOutputPayload {

@@ -7,6 +7,9 @@
 //!
 //! Persistent thread settings apply on Started and Steered. Turn start
 //! options only apply on Started.
+//! Host shutdown admission is checked before reserving or starting a new turn.
+//! Parent-delegated subagent input bypasses drain; automatic starts remain gated.
+//! Realtime drain refusals are returned to the fanout for ordered session teardown.
 
 use super::TurnInput;
 use super::session::Session;
@@ -28,6 +31,8 @@ use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::NonSteerableTurnKind;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::turn_input::NotSubmittedReason;
 use codex_protocol::turn_input::TurnInput as SubmittedTurnInput;
@@ -211,7 +216,31 @@ pub(super) async fn handle(
                 | SubmittedTurnInput::ResponseItem(_)
                 | SubmittedTurnInput::InterAgentCommunication(_) => TurnStartKind::Automatic,
             };
-            start_if_idle(session, request, submission_id, kind).await
+            start_if_idle(
+                session,
+                request,
+                submission_id,
+                kind,
+                /*expected_previous_turn_id*/ None,
+            )
+            .await
+        }
+        TurnInputMode::ContinueIfIdle {
+            expected_previous_turn_id,
+        } => {
+            if !matches!(&request.input, SubmittedTurnInput::ResponseItem(_)) {
+                return Err(CodexErr::InvalidRequest(
+                    "continuation requires internal response input".to_string(),
+                ));
+            }
+            start_if_idle(
+                session,
+                request,
+                submission_id,
+                TurnStartKind::Recovery,
+                Some(expected_previous_turn_id),
+            )
+            .await
         }
         TurnInputMode::Steer { expected_turn_id } => {
             steer(session, request, expected_turn_id, submission_id).await
@@ -231,7 +260,14 @@ pub(super) async fn handle_recovery(
             turn_trigger: Some("retry".to_string()),
             ..start_options
         });
-    start_if_idle(session, request, submission_id, TurnStartKind::Recovery).await
+    start_if_idle(
+        session,
+        request,
+        submission_id,
+        TurnStartKind::Recovery,
+        /*expected_previous_turn_id*/ None,
+    )
+    .await
 }
 
 async fn start_or_steer(
@@ -276,6 +312,28 @@ async fn start_or_steer(
             Ok(TurnInputSubmission::Steered { turn_id })
         }
         Err(NotSubmittedReason::NoActiveTurn) => {
+            // MAv1 sends explicit input to spawned agents as part of an existing
+            // parent's work. Client RPCs are gated separately by the host.
+            let is_delegated_input = settings.start_options.parent_turn_id.is_some()
+                && matches!(
+                    session
+                        .state
+                        .lock()
+                        .await
+                        .session_configuration
+                        .session_source,
+                    SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+                );
+            let _admission = if is_delegated_input {
+                None
+            } else {
+                let Some(admission) = session.services.extensions.admit_turn_start() else {
+                    return Ok(TurnInputSubmission::NotSubmitted {
+                        reason: NotSubmittedReason::ServerDraining,
+                    });
+                };
+                Some(admission)
+            };
             let Some(turn_context) = settings
                 .apply_started(session, submission_id.clone(), TurnStartKind::User)
                 .await?
@@ -308,11 +366,16 @@ async fn start_or_steer(
     }
 }
 
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the previous turn check and idle reservation must be atomic"
+)]
 async fn start_if_idle(
     session: &Arc<Session>,
     request: TurnInputRequest,
     submission_id: String,
     kind: TurnStartKind,
+    expected_previous_turn_id: Option<String>,
 ) -> CodexResult<TurnInputSubmission> {
     let TurnInputRequest {
         input,
@@ -337,11 +400,39 @@ async fn start_if_idle(
         });
     }
 
+    let _admission = session.services.extensions.admit_turn_start();
+    // A one-shot review delegate completes its already-running parent's work.
+    // Its explicit input carries parent lineage; automatic starts do not qualify.
+    if _admission.is_none()
+        && !(kind == TurnStartKind::User
+            && start.parent_turn_id.is_some()
+            && matches!(
+                session
+                    .state
+                    .lock()
+                    .await
+                    .session_configuration
+                    .session_source,
+                SessionSource::SubAgent(SubAgentSource::Review)
+            ))
+    {
+        return Ok(TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::ServerDraining,
+        });
+    }
+
     let turn_state = {
         let mut active_turn = session.active_turn.lock().await;
         if active_turn.is_some() {
             return Ok(TurnInputSubmission::NotSubmitted {
                 reason: NotSubmittedReason::NotIdle,
+            });
+        }
+        if let Some(expected) = expected_previous_turn_id
+            && session.state.lock().await.last_started_turn_id.as_ref() != Some(&expected)
+        {
+            return Ok(TurnInputSubmission::NotSubmitted {
+                reason: NotSubmittedReason::Superseded,
             });
         }
         let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
@@ -397,7 +488,7 @@ async fn start_if_idle(
             }
             task_input.push(pending_turn_input(session, input).await);
         }
-        TurnStartKind::Automatic => {
+        TurnStartKind::Automatic | TurnStartKind::Recovery => {
             // Empty automatic user input resumes sampling without a new message.
             if !matches!(&input, SubmittedTurnInput::UserInput { .. }) {
                 session
@@ -408,9 +499,6 @@ async fn start_if_idle(
                     )
                     .await;
             }
-        }
-        TurnStartKind::Recovery => {
-            // Recovery resumes an existing turn without a new empty user message.
         }
     }
     session
@@ -460,7 +548,15 @@ async fn steer(
 }
 
 impl Session {
-    pub(crate) async fn route_realtime_text_input(self: &Arc<Self>, text: String) {
+    /// Called under the active-turn lock before running any task or lifecycle callback.
+    pub(crate) async fn record_started_turn(&self, turn_id: &str) {
+        self.state.lock().await.last_started_turn_id = Some(turn_id.to_string());
+    }
+
+    pub(crate) async fn route_realtime_text_input(
+        self: &Arc<Self>,
+        text: String,
+    ) -> Result<(), &'static str> {
         let submission_id = Uuid::now_v7().to_string();
         let submission = handle(
             self,
@@ -478,6 +574,11 @@ impl Session {
         .await;
         match submission {
             Ok(TurnInputSubmission::Started { .. } | TurnInputSubmission::Steered { .. }) => {}
+            Ok(TurnInputSubmission::NotSubmitted {
+                reason: NotSubmittedReason::ServerDraining,
+            }) => {
+                return Err("Server is draining; retry the turn after reconnecting");
+            }
             Ok(TurnInputSubmission::NotSubmitted { reason }) => {
                 self.send_event_raw(Event {
                     id: submission_id,
@@ -497,6 +598,7 @@ impl Session {
                 .await;
             }
         }
+        Ok(())
     }
 
     async fn clear_reserved_idle_turn(&self, turn_state: &Arc<tokio::sync::Mutex<TurnState>>) {

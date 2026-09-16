@@ -6,7 +6,6 @@ use crate::environment_selection::ThreadEnvironments;
 use codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID;
 use codex_config::McpServerConfig;
 use codex_connectors::ConnectorRuntimeManager;
-use codex_connectors::ConnectorSnapshot;
 use codex_connectors::PluginConnectorSource;
 use codex_core_plugins::PluginsManager;
 use codex_exec_server::ExecutorCapabilityDiscoverySnapshot;
@@ -59,6 +58,7 @@ pub(crate) struct McpThreadIdentity<'a> {
     pub(crate) session_source: &'a SessionSource,
     pub(crate) originator: &'a str,
     pub(crate) environments: McpEnvironmentScope<'a>,
+    pub(crate) disabled_plugin_ids: &'a [String],
 }
 
 enum OrderedMcpOverlay {
@@ -119,6 +119,7 @@ impl McpManager {
             /*originator*/
             None,
             McpEnvironmentScope::HostOnly,
+            &[],
         )
         .await
         .config
@@ -146,6 +147,7 @@ impl McpManager {
             .with_session_source(identity.session_source),
             Some(identity.originator),
             identity.environments,
+            identity.disabled_plugin_ids,
         )
         .await
     }
@@ -155,6 +157,7 @@ impl McpManager {
         context: McpServerContributionContext<'_, Config>,
         originator: Option<&str>,
         environment_scope: McpEnvironmentScope<'_>,
+        disabled_plugin_ids: &[String],
     ) -> McpRuntimeProjection {
         let config = context.config();
         let mut selected_plugin_available = false;
@@ -179,6 +182,21 @@ impl McpManager {
                             ),
                         )));
                     }
+                    McpServerContribution::SetWithProtocolMode {
+                        name,
+                        config,
+                        protocol_mode,
+                    } => {
+                        overlays.push(OrderedMcpOverlay::Set(Box::new(
+                            McpServerRegistration::from_extension(
+                                name,
+                                contributor.id(),
+                                contribution_order,
+                                *config,
+                            )
+                            .with_protocol_mode(protocol_mode),
+                        )));
+                    }
                     McpServerContribution::HostedApps { config } => {
                         overlays.push(OrderedMcpOverlay::Set(Box::new(
                             McpServerRegistration::from_hosted_apps(
@@ -188,6 +206,8 @@ impl McpManager {
                             ),
                         )));
                     }
+                    McpServerContribution::SelectedPlugin { ref plugin_id, .. }
+                        if disabled_plugin_ids.contains(plugin_id) => {}
                     McpServerContribution::SelectedPlugin {
                         name,
                         plugin_id,
@@ -213,11 +233,15 @@ impl McpManager {
                         plugin_display_name,
                         connector_ids,
                     } => {
-                        selected_plugin_available = true;
-                        selected_plugins.push(SelectedPluginIdentity {
-                            selected_root_id,
-                            plugin_id: plugin_id.clone(),
-                        });
+                        if disabled_plugin_ids.contains(&plugin_id) {
+                            disabled_plugin_roots.push(selected_root_id);
+                        } else {
+                            selected_plugin_available = true;
+                            selected_plugins.push(SelectedPluginIdentity {
+                                selected_root_id,
+                                plugin_id: plugin_id.clone(),
+                            });
+                        }
                         if !connector_ids.is_empty() {
                             selected_plugin_connector_sources.push(
                                 PluginConnectorSource::from_connector_ids(
@@ -244,6 +268,19 @@ impl McpManager {
             .plugins_manager
             .plugins_for_config(&config.plugins_config_input())
             .await;
+        let host_plugin_connector_sources = loaded_plugins
+            .capability_summaries()
+            .iter()
+            .map(PluginConnectorSource::from);
+        let connector_snapshot = if config.features.enabled(Feature::Plugins) {
+            self.plugins_manager.connector_snapshot(
+                host_plugin_connector_sources.chain(selected_plugin_connector_sources),
+                disabled_plugin_ids,
+            )
+        } else {
+            Default::default()
+        };
+        let loaded_plugins = loaded_plugins.without_plugins(disabled_plugin_ids);
         let plugins_available =
             selected_plugin_available || !loaded_plugins.capability_summaries().is_empty();
         let mut mcp_config = config
@@ -318,12 +355,7 @@ impl McpManager {
             );
         }
         mcp_config.mcp_server_catalog = catalog;
-        mcp_config.connector_snapshot =
-            mcp_config
-                .connector_snapshot
-                .merged_with(&ConnectorSnapshot::from_plugin_sources(
-                    selected_plugin_connector_sources,
-                ));
+        mcp_config.connector_snapshot = connector_snapshot;
         McpRuntimeProjection {
             config: mcp_config,
             plugins_available,

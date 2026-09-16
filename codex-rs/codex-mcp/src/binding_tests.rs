@@ -77,8 +77,12 @@ async fn test_step(
             .await
             .expect("create in-process MCP client"),
     );
-    let tool_catalog = Arc::new(ClientToolCatalog::new(vec![tool.clone()]));
+    let tool_catalog = Arc::new(ClientToolCatalog::new(
+        vec![tool.clone()],
+        /*updates*/ None,
+    ));
     let managed_client = Arc::new(ManagedClient {
+        _auth_change_notifications: None,
         client: Arc::clone(&client),
         server_info: McpServerInfo {
             name: label.to_string(),
@@ -114,7 +118,7 @@ async fn test_step(
         Arc::clone(&connections),
         managed_client,
         Arc::clone(&config),
-        /*catalog_revision*/ 0,
+        tool_catalog.read(Arc::new).await,
         tool.clone(),
         McpServerMetadata {
             environment_id: format!("{label}-environment"),

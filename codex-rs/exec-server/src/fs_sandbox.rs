@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use codex_exec_server_protocol::JSONRPCErrorError;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
@@ -16,7 +17,6 @@ use codex_sandboxing::SandboxExecRequest;
 use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxTransformRequest;
 use codex_sandboxing::SandboxType;
-use codex_sandboxing::SandboxablePreference;
 use codex_utils_absolute_path::AbsolutePathBuf;
 #[cfg(not(target_os = "linux"))]
 use codex_utils_absolute_path::canonicalize_preserving_symlinks;
@@ -73,6 +73,7 @@ impl FileSystemSandboxRunner {
         }
     }
 
+    #[tracing::instrument(name = "fs.sandbox_request", skip_all)]
     pub(crate) async fn run(
         &self,
         sandbox: &FileSystemSandboxContext,
@@ -83,6 +84,11 @@ impl FileSystemSandboxRunner {
         run_command(command, request_json).await
     }
 
+    #[tracing::instrument(
+        name = "fs.sandbox_prepare",
+        skip_all,
+        fields(permission_entries = tracing::field::Empty)
+    )]
     pub(crate) fn sandbox_command(
         &self,
         sandbox: &FileSystemSandboxContext,
@@ -101,6 +107,7 @@ impl FileSystemSandboxRunner {
         let native_permissions =
             native_permissions.materialize_project_roots_with_workspace_roots(workspace_roots);
         let mut file_system_policy = native_permissions.file_system_sandbox_policy();
+        tracing::Span::current().record("permission_entries", file_system_policy.entries.len());
         let helper_read_roots = if sandbox.use_legacy_landlock {
             Vec::new()
         } else {
@@ -137,10 +144,10 @@ impl FileSystemSandboxRunner {
         let sandbox_manager = sandbox_manager.with_allowed_symlinked_codex_home(
             self.runtime_paths.allowed_symlinked_codex_home.clone(),
         );
-        let sandbox = sandbox_manager.select_initial(
+        let (sandbox, windows_sandbox_level) = crate::sandbox_selection::select_sandbox(
+            &sandbox_manager,
             permission_profile,
-            SandboxablePreference::Require,
-            sandbox_context.windows_sandbox_level,
+            sandbox_context,
             /*has_managed_network_requirements*/ false,
         );
         if sandbox == SandboxType::None {
@@ -169,9 +176,14 @@ impl FileSystemSandboxRunner {
                     environment_id: None,
                     network: None,
                     sandbox_policy_cwd: &cwd.uri,
-                    codex_linux_sandbox_exe: self.runtime_paths.codex_linux_sandbox_exe.as_deref(),
+                    sandbox_exe: if cfg!(windows) {
+                        Some(self.runtime_paths.codex_self_exe.as_path())
+                    } else {
+                        self.runtime_paths.codex_linux_sandbox_exe.as_deref()
+                    },
                     use_legacy_landlock: sandbox_context.use_legacy_landlock,
-                    windows_sandbox_level: sandbox_context.windows_sandbox_level,
+                    windows_sandbox_level: windows_sandbox_level
+                        .unwrap_or(WindowsSandboxLevel::Disabled),
                     windows_sandbox_private_desktop: sandbox_context
                         .windows_sandbox_private_desktop,
                 },
@@ -324,6 +336,7 @@ fn bazel_bwrap_env_key_is_allowed(_key: &str) -> bool {
     false
 }
 
+#[tracing::instrument(name = "fs.sandbox_execute", skip_all)]
 async fn run_command(
     command: SandboxExecRequest,
     request_json: Vec<u8>,
@@ -709,8 +722,8 @@ mod tests {
                 "filesystem sandbox cannot be enforced on this executor"
             );
             crate::FileSystemSandboxContext {
-                windows_sandbox_level:
-                    codex_protocol::config_types::WindowsSandboxLevel::RestrictedToken,
+                windows_sandbox_selection:
+                    codex_file_system::WindowsSandboxSelection::RestrictedToken,
                 ..sandbox_context
             }
         };

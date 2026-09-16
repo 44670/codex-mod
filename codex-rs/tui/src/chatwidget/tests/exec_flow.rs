@@ -164,6 +164,7 @@ async fn replayed_commands_preserve_individual_output_and_failure_status() {
     let cwd = chat.config.cwd.clone();
     let replayed_command =
         |id: &str, output: &str, source: ExecCommandSource| AppServerThreadItem::CommandExecution {
+            model_context: None,
             id: id.to_string(),
             command: format!("printf {output}"),
             cwd: cwd.clone().into(),
@@ -612,6 +613,7 @@ async fn exec_end_without_begin_uses_event_command() {
     handle_exec_end(
         &mut chat,
         AppServerThreadItem::CommandExecution {
+            model_context: None,
             id: "call-orphan".to_string(),
             command: codex_shell_command::parse_command::shlex_join(&command),
             cwd: cwd.into(),
@@ -847,7 +849,7 @@ async fn unified_exec_end_after_task_complete_is_suppressed() {
     drain_insert_history(&mut rx);
 
     chat.on_task_complete(
-        /*last_agent_message*/ None, /*duration_ms*/ None, /*from_replay*/ false,
+        /*last_agent_message*/ None, /*completion*/ None, /*from_replay*/ false,
     );
     end_exec(&mut chat, begin, "", "", /*exit_code*/ 0);
 
@@ -863,7 +865,7 @@ async fn unified_exec_interaction_after_task_complete_is_suppressed() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.on_task_started();
     chat.on_task_complete(
-        /*last_agent_message*/ None, /*duration_ms*/ None, /*from_replay*/ false,
+        /*last_agent_message*/ None, /*completion*/ None, /*from_replay*/ false,
     );
 
     terminal_interaction(&mut chat, "call-1", "proc-1", "ls\n");
@@ -891,7 +893,10 @@ async fn unified_exec_wait_after_final_agent_message_snapshot() {
         .iter()
         .map(|lines| lines_to_single_string(lines))
         .collect::<String>();
-    assert_chatwidget_snapshot!("unified_exec_wait_after_final_agent_message", combined);
+    assert_chatwidget_snapshot!(
+        "unified_exec_wait_after_final_agent_message",
+        normalize_completion_timestamps(combined)
+    );
 }
 
 #[tokio::test]
@@ -915,7 +920,10 @@ async fn unified_exec_wait_before_streamed_agent_message_snapshot() {
         .iter()
         .map(|lines| lines_to_single_string(lines))
         .collect::<String>();
-    assert_chatwidget_snapshot!("unified_exec_wait_before_streamed_agent_message", combined);
+    assert_chatwidget_snapshot!(
+        "unified_exec_wait_before_streamed_agent_message",
+        normalize_completion_timestamps(combined)
+    );
 }
 
 #[tokio::test]
@@ -952,10 +960,13 @@ async fn final_worked_for_uses_cumulative_turn_duration_snapshot() {
             .map(|lines| lines_to_single_string(lines))
             .collect::<String>();
         assert!(
-            combined.contains("Worked for 2m 05s"),
+            combined.contains("Worked for 2m 5s"),
             "expected final separator to use cumulative turn duration, got:\n{combined}"
         );
-        assert_chatwidget_snapshot!("final_worked_for_uses_cumulative_turn_duration", combined);
+        assert_chatwidget_snapshot!(
+            "final_worked_for_uses_cumulative_turn_duration",
+            normalize_completion_timestamps(combined)
+        );
     }
 }
 
@@ -1027,7 +1038,10 @@ async fn unified_exec_waiting_multiple_empty_snapshots() {
         .iter()
         .map(|lines| lines_to_single_string(lines))
         .collect::<String>();
-    assert_chatwidget_snapshot!("unified_exec_waiting_multiple_empty_after", combined);
+    assert_chatwidget_snapshot!(
+        "unified_exec_waiting_multiple_empty_after",
+        normalize_completion_timestamps(combined)
+    );
 }
 
 #[tokio::test]
@@ -1107,7 +1121,10 @@ async fn unified_exec_non_empty_then_empty_snapshots() {
         combined.push('\n');
     }
     combined.push_str(&post);
-    assert_chatwidget_snapshot!("unified_exec_non_empty_then_empty_after", combined);
+    assert_chatwidget_snapshot!(
+        "unified_exec_non_empty_then_empty_after",
+        normalize_completion_timestamps(combined)
+    );
 }
 
 #[tokio::test]
@@ -1282,6 +1299,7 @@ async fn bang_shell_enter_while_task_running_submits_run_user_shell_command() {
     let thread_id = ThreadId::new();
     let rollout_file = NamedTempFile::new().unwrap();
     let configured = crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
         forked_from_id: None,
         fork_parent_title: None,

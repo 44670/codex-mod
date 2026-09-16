@@ -40,6 +40,7 @@ use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::LocalShellAction;
 use codex_protocol::models::LocalShellExecAction;
 use codex_protocol::models::LocalShellStatus;
@@ -637,9 +638,6 @@ async fn response_item_ids_are_sent_for_all_remote_v2_compaction_requests() -> a
     .await;
     let test = test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
-        .with_config(|config| {
-            let _ = config.features.enable(Feature::RemoteCompactionV2);
-        })
         .build(&server)
         .await?;
 
@@ -1081,7 +1079,9 @@ async fn resume_replays_legacy_js_repl_image_rollout_shapes() {
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputImage {
-                    image_url: legacy_image_url.to_string(),
+                    image: ImageReference::Inline {
+                        image_url: legacy_image_url.to_string(),
+                    },
                     detail: Some(DEFAULT_IMAGE_DETAIL),
                 }],
                 phase: None,
@@ -1221,7 +1221,9 @@ async fn resume_replays_image_tool_outputs_with_detail() {
                 namespace: None,
                 output: FunctionCallOutputPayload::from_content_items(vec![
                     FunctionCallOutputContentItem::InputImage {
-                        image_url: image_url.to_string(),
+                        image: ImageReference::Inline {
+                            image_url: image_url.to_string(),
+                        },
                         detail: Some(ImageDetail::Original),
                     },
                 ]),
@@ -1250,7 +1252,9 @@ async fn resume_replays_image_tool_outputs_with_detail() {
                 name: None,
                 output: FunctionCallOutputPayload::from_content_items(vec![
                     FunctionCallOutputContentItem::InputImage {
-                        image_url: image_url.to_string(),
+                        image: ImageReference::Inline {
+                            image_url: image_url.to_string(),
+                        },
                         detail: Some(ImageDetail::Original),
                     },
                 ]),
@@ -1575,6 +1579,7 @@ async fn send_request_with_provider(provider: ModelProviderInfo) {
             .enabled(Feature::ConcurrentReasoningSummaries),
         /*attestation_provider*/ None,
         config.http_client_factory(),
+        config.workspace_routing_context(),
     );
     let responses_metadata = test_turn_responses_metadata(&client, thread_id);
     let mut client_session = client.new_session();
@@ -1844,11 +1849,11 @@ async fn includes_user_instructions_message_in_request() {
         .with_pre_build_hook(|home| {
             std::fs::write(home.join("AGENTS.md"), "be nice").expect("write global instructions");
         });
-    let codex = builder
+    let test = builder
         .build(&server)
         .await
-        .expect("create new conversation")
-        .codex;
+        .expect("create new conversation");
+    let codex = test.codex.clone();
 
     codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
@@ -2309,7 +2314,7 @@ async fn includes_default_reasoning_effort_in_request_when_defined_by_model_info
         sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
     )
     .await;
-    let TestCodex { codex, .. } = test_codex().with_model("gpt-5.4").build(&server).await?;
+    let TestCodex { codex, .. } = test_codex().with_model("gpt-5.5").build(&server).await?;
 
     codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
@@ -2463,12 +2468,12 @@ async fn model_without_summary_parameter_support_omits_configured_summary() -> a
     let model = model_catalog
         .models
         .iter_mut()
-        .find(|model| model.slug == "gpt-5.4")
-        .expect("gpt-5.4 exists in bundled models.json");
+        .find(|model| model.slug == "gpt-5.5")
+        .expect("gpt-5.5 exists in bundled models.json");
     model.supports_reasoning_summary_parameter = false;
 
     let TestCodex { codex, .. } = test_codex()
-        .with_model("gpt-5.4")
+        .with_model("gpt-5.5")
         .with_config(move |config| {
             config.model_catalog = Some(model_catalog);
             config.model_reasoning_effort = Some(ReasoningEffort::High);
@@ -2597,8 +2602,8 @@ async fn user_turn_explicit_reasoning_summary_overrides_model_catalog_default() 
     let model = model_catalog
         .models
         .iter_mut()
-        .find(|model| model.slug == "gpt-5.4")
-        .expect("gpt-5.4 exists in bundled models.json");
+        .find(|model| model.slug == "gpt-5.5")
+        .expect("gpt-5.5 exists in bundled models.json");
     model.default_reasoning_summary = ReasoningSummary::Detailed;
 
     let TestCodex {
@@ -2607,7 +2612,7 @@ async fn user_turn_explicit_reasoning_summary_overrides_model_catalog_default() 
         session_configured,
         ..
     } = test_codex()
-        .with_model("gpt-5.4")
+        .with_model("gpt-5.5")
         .with_config(move |config| {
             config.model_catalog = Some(model_catalog);
         })
@@ -2710,12 +2715,12 @@ async fn reasoning_summary_none_overrides_model_catalog_default() -> anyhow::Res
     let model = model_catalog
         .models
         .iter_mut()
-        .find(|model| model.slug == "gpt-5.4")
-        .expect("gpt-5.4 exists in bundled models.json");
+        .find(|model| model.slug == "gpt-5.5")
+        .expect("gpt-5.5 exists in bundled models.json");
     model.default_reasoning_summary = ReasoningSummary::Detailed;
 
     let TestCodex { codex, .. } = test_codex()
-        .with_model("gpt-5.4")
+        .with_model("gpt-5.5")
         .with_config(move |config| {
             config.model_reasoning_summary = Some(ReasoningSummary::None);
             config.model_catalog = Some(model_catalog);
@@ -2754,7 +2759,7 @@ async fn includes_default_verbosity_in_request() -> anyhow::Result<()> {
         sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
     )
     .await;
-    let TestCodex { codex, .. } = test_codex().with_model("gpt-5.4").build(&server).await?;
+    let TestCodex { codex, .. } = test_codex().with_model("gpt-5.5").build(&server).await?;
 
     codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
@@ -2832,7 +2837,7 @@ async fn configured_verbosity_is_sent() -> anyhow::Result<()> {
     )
     .await;
     let TestCodex { codex, .. } = test_codex()
-        .with_model("gpt-5.4")
+        .with_model("gpt-5.5")
         .with_config(|config| {
             config.model_verbosity = Some(Verbosity::High);
         })
@@ -2881,11 +2886,11 @@ async fn includes_developer_instructions_message_in_request() {
         .with_config(|config| {
             config.developer_instructions = Some("be useful".to_string());
         });
-    let codex = builder
+    let test = builder
         .build(&server)
         .await
-        .expect("create new conversation")
-        .codex;
+        .expect("create new conversation");
+    let codex = test.codex.clone();
 
     codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
@@ -3066,6 +3071,7 @@ async fn azure_responses_request_does_not_store_and_preserves_prefixed_item_ids(
         /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
         config.http_client_factory(),
+        config.workspace_routing_context(),
     );
     let responses_metadata = test_turn_responses_metadata(&client, thread_id);
     let mut client_session = client.new_session();

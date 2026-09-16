@@ -25,6 +25,7 @@ pub(super) fn sampler_failure_reason(error: &LunaSamplerError) -> &'static str {
         LunaSamplerError::OutputTooLarge => "output_too_large",
         LunaSamplerError::Superseded => "superseded",
         LunaSamplerError::IncompatibleCompaction => "incompatible_compaction",
+        LunaSamplerError::InputTooLarge => "input_too_large",
         LunaSamplerError::Api(error) => match error {
             ApiError::Transport(TransportError::Http { status, .. })
             | ApiError::Api { status, .. } => match status.as_u16() {
@@ -40,6 +41,7 @@ pub(super) fn sampler_failure_reason(error: &LunaSamplerError) -> &'static str {
             ApiError::Transport(TransportError::Network(_)) => "network_error",
             ApiError::Transport(TransportError::RetryLimit) => "retry_limit",
             ApiError::Transport(TransportError::Build(_)) => "request_build_error",
+            ApiError::Transport(TransportError::ResponseTooLarge { .. }) => "response_too_large",
             ApiError::Stream(_) => "stream_error",
             ApiError::ContextWindowExceeded => "context_window_exceeded",
             ApiError::QuotaExceeded => "quota_exceeded",
