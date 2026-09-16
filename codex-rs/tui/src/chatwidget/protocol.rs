@@ -35,6 +35,10 @@ impl ChatWidget {
         if !is_resume_initial_replay && !is_retry_error {
             self.restore_retry_status_header_if_present();
         }
+        if !from_replay && let Some(cell) = history_cell::new_model_diagnostic(&notification) {
+            self.add_to_history(cell);
+            self.request_redraw();
+        }
         match notification {
             ServerNotification::ThreadTokenUsageUpdated(notification) => {
                 let info = token_usage_info_from_app_server(notification.token_usage);
@@ -227,7 +231,14 @@ impl ChatWidget {
                     vec!["✓ ".green(), notification.message.into()].into(),
                 ]);
             }
-            ServerNotification::Warning(notification) => self.on_warning(notification.message),
+            ServerNotification::Warning(notification) => {
+                if !notification
+                    .message
+                    .starts_with(codex_protocol::protocol::ROUTING_HINT_WARNING_PREFIX)
+                {
+                    self.on_warning(notification.message);
+                }
+            }
             ServerNotification::GuardianWarning(notification) => {
                 if !notification
                     .message

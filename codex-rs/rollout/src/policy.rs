@@ -111,6 +111,8 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
                 )
         }
         EventMsg::TokenCount(_)
+        | EventMsg::ModelReroute(_)
+        | EventMsg::SafetyBuffering(_)
         | EventMsg::ThreadGoalUpdated(_)
         | EventMsg::ThreadRolledBack(_)
         | EventMsg::TurnAborted(_)
@@ -138,6 +140,11 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
                 && event.kind != SubAgentActivityKind::Completed
         }
 
+        // Persist only the explicitly tagged routing observation, not arbitrary warnings.
+        EventMsg::Warning(event) => event
+            .message
+            .starts_with(codex_protocol::protocol::ROUTING_HINT_WARNING_PREFIX),
+
         // Transient, non-durable events.
         EventMsg::Error(_)
         | EventMsg::ThreadQueueChanged(_)
@@ -151,7 +158,6 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::CollabResumeEnd(_)
         | EventMsg::DynamicToolCallRequest(_)
         | EventMsg::DynamicToolCallResponse(_)
-        | EventMsg::Warning(_)
         | EventMsg::AuthRecoveryStarted(_)
         | EventMsg::AuthRecoveryCompleted(_)
         | EventMsg::GuardianWarning(_)
@@ -159,8 +165,6 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::RealtimeConversationSdp(_)
         | EventMsg::RealtimeConversationRealtime(_)
         | EventMsg::RealtimeConversationClosed(_)
-        | EventMsg::SafetyBuffering(_)
-        | EventMsg::ModelReroute(_)
         | EventMsg::ModelVerification(_)
         | EventMsg::TurnModerationMetadata(_)
         | EventMsg::AgentReasoningSectionBreak(_)

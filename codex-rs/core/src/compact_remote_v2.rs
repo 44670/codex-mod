@@ -838,6 +838,7 @@ mod tests {
         drop(tx_event);
         ResponseStream {
             rx_event,
+            routing_hint: None,
             consumer_dropped: CancellationToken::new(),
         }
     }

@@ -2464,6 +2464,18 @@ async fn try_run_sampling_request(
         .instrument(trace_span!("stream_request"))
         .or_cancel(&cancellation_token)
         .await??;
+    if let Some(value) = stream.routing_hint.take() {
+        sess.send_event(
+            &turn_context,
+            EventMsg::Warning(codex_protocol::protocol::WarningEvent {
+                message: format!(
+                    "{}{value}",
+                    codex_protocol::protocol::ROUTING_HINT_WARNING_PREFIX
+                ),
+            }),
+        )
+        .await;
+    }
     let mut in_flight: FuturesOrdered<InFlightFuture<'static>> = FuturesOrdered::new();
     let mut needs_follow_up = false;
     let mut last_agent_message: Option<String> = None;

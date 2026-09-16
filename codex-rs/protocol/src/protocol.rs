@@ -2084,6 +2084,9 @@ impl ErrorEvent {
     }
 }
 
+/// Identifies local routing diagnostics carried over the existing warning channel.
+pub const ROUTING_HINT_WARNING_PREFIX: &str = "x-codex-routing-hint (request): ";
+
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct WarningEvent {
     pub message: String,

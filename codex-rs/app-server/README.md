@@ -1,3 +1,19 @@
+# Model routing diagnostics (custom build)
+
+Routing hints use the existing `warning` notification with the message prefix
+`x-codex-routing-hint (request): `; no protocol types are added. They are emitted
+when a sampling request opens a response stream with that header. For WebSockets,
+the value is taken from the active connection's handshake, including when that
+connection is reused. Prewarming alone does not emit this notification. Failed
+attempts that do not open a response stream are not recorded by this diagnostic.
+This is a client request hint, not confirmation of the model used by the server.
+
+The custom build persists those tagged `warning` events, `model_reroute`, and
+`safety_buffering` as `event_msg` entries in session JSONL, not model input.
+Other warnings retain upstream's persistence behavior.
+The TUI displays live notifications in red without changing the existing safety
+buffering controls. These diagnostic lines are not replayed on resume.
+
 # MCP App UI
 
 `mcpToolCall.mcpAppUi` records the invoked descriptor's `resourceUri`
