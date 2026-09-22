@@ -13,6 +13,7 @@ from .v2_all import AccountUpdatedNotification
 from .v2_all import AgentMessageDeltaNotification
 from .v2_all import AppListUpdatedNotification
 from .v2_all import AuthRecoveryNotification
+from .v2_all import ClientRoutingHintNotification
 from .v2_all import CommandExecOutputDeltaNotification
 from .v2_all import CommandExecutionOutputDeltaNotification
 from .v2_all import ConfigWarningNotification
@@ -49,6 +50,7 @@ from .v2_all import ReasoningSummaryPartAddedNotification
 from .v2_all import ReasoningSummaryTextDeltaNotification
 from .v2_all import ReasoningTextDeltaNotification
 from .v2_all import RemoteControlStatusChangedNotification
+from .v2_all import ResponseModelNotification
 from .v2_all import ServerRequestResolvedNotification
 from .v2_all import SkillsChangedNotification
 from .v2_all import StrictReviewRequiredNotification
@@ -95,6 +97,7 @@ KnownNotificationPayload: TypeAlias = (
     | AgentMessageDeltaNotification
     | AppListUpdatedNotification
     | AuthRecoveryNotification
+    | ClientRoutingHintNotification
     | CommandExecOutputDeltaNotification
     | CommandExecutionOutputDeltaNotification
     | ConfigWarningNotification
@@ -131,6 +134,7 @@ KnownNotificationPayload: TypeAlias = (
     | ReasoningSummaryTextDeltaNotification
     | ReasoningTextDeltaNotification
     | RemoteControlStatusChangedNotification
+    | ResponseModelNotification
     | ServerRequestResolvedNotification
     | SkillsChangedNotification
     | StrictReviewRequiredNotification
@@ -206,7 +210,9 @@ NOTIFICATION_MODELS: dict[str, type[KnownNotificationPayload]] = {
     "mcpServer/event/stream/notification": McpServerEventStreamNotification,
     "mcpServer/oauthLogin/completed": McpServerOauthLoginCompletedNotification,
     "mcpServer/startupStatus/updated": McpServerStatusUpdatedNotification,
+    "model/clientRoutingHint": ClientRoutingHintNotification,
     "model/rerouted": ModelReroutedNotification,
+    "model/responseModel": ResponseModelNotification,
     "model/safetyBuffering/updated": ModelSafetyBufferingUpdatedNotification,
     "model/verification": ModelVerificationNotification,
     "modelProvider/authRecoveryCompleted": AuthRecoveryNotification,
@@ -259,6 +265,7 @@ NOTIFICATION_MODELS: dict[str, type[KnownNotificationPayload]] = {
 DIRECT_TURN_ID_NOTIFICATION_TYPES: tuple[type[BaseModel], ...] = (
     AgentMessageDeltaNotification,
     AuthRecoveryNotification,
+    ClientRoutingHintNotification,
     CommandExecutionOutputDeltaNotification,
     ContextCompactedNotification,
     ErrorNotification,
@@ -278,6 +285,7 @@ DIRECT_TURN_ID_NOTIFICATION_TYPES: tuple[type[BaseModel], ...] = (
     ReasoningSummaryPartAddedNotification,
     ReasoningSummaryTextDeltaNotification,
     ReasoningTextDeltaNotification,
+    ResponseModelNotification,
     StrictReviewRequiredNotification,
     TerminalInteractionNotification,
     ThreadGoalUpdatedNotification,

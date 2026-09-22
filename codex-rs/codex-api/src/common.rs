@@ -98,6 +98,8 @@ pub enum ResponseEvent {
     ServerReasoningIncluded(bool),
     Completed {
         response_id: String,
+        /// Observed `response.completed.response.model`, separate from routing headers.
+        model: Option<String>,
         token_usage: Option<TokenUsage>,
         usage_metadata: Option<ResponseUsageMetadata>,
         /// Did the model affirmatively end its turn? Some providers do not set this,

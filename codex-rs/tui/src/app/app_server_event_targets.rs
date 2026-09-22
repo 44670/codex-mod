@@ -136,6 +136,10 @@ pub(super) fn server_notification_thread_target(
         }
         ServerNotification::ContextCompacted(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::ModelRerouted(notification) => Some(notification.thread_id.as_str()),
+        ServerNotification::ClientRoutingHint(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::ResponseModel(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::ModelVerification(notification) => {
             Some(notification.thread_id.as_str())
         }

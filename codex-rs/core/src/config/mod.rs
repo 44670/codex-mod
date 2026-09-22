@@ -1110,11 +1110,11 @@ pub struct Config {
     pub disable_paste_burst: bool,
 
     /// When `false`, disables analytics across Codex product surfaces in this machine.
-    /// Voluntarily left as Optional because the default value might depend on the client.
+    /// This custom build resolves an unspecified value to `Some(false)` for all clients.
     pub analytics_enabled: Option<bool>,
 
     /// When `false`, disables feedback collection across Codex product surfaces.
-    /// Defaults to `true`.
+    /// Defaults to `false`.
     pub feedback_enabled: bool,
 
     /// Configured discoverable tools for tool suggestions.
@@ -4395,12 +4395,17 @@ impl Config {
                 .and_then(|tui| tui.disable_paste_burst)
                 .or(cfg.disable_paste_burst)
                 .unwrap_or(false),
-            analytics_enabled: cfg.analytics.as_ref().and_then(|a| a.enabled),
+            analytics_enabled: Some(
+                cfg.analytics
+                    .as_ref()
+                    .and_then(|a| a.enabled)
+                    .unwrap_or(false),
+            ),
             feedback_enabled: cfg
                 .feedback
                 .as_ref()
                 .and_then(|feedback| feedback.enabled)
-                .unwrap_or(true),
+                .unwrap_or(false),
             tool_suggest,
             tui_notifications: cfg
                 .tui

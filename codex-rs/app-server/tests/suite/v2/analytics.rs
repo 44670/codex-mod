@@ -30,6 +30,8 @@ use codex_config::types::AuthCredentialsStoreMode;
 use codex_config::types::OtelExporterKind;
 use codex_config::types::OtelHttpProtocol;
 use codex_core::config::ConfigBuilder;
+use codex_core::config::edit::ConfigEdit;
+use codex_core::config::edit::ConfigEditsBuilder;
 use codex_core_plugins::loader::curated_plugin_cache_version;
 use codex_core_plugins::store::PluginStore;
 use codex_features::Feature;
@@ -66,13 +68,13 @@ async fn guardian_review_turns_and_tools_reach_analytics() -> Result<()> {
     const READ_TIMEOUT: Duration = Duration::from_secs(60);
     let server = responses::start_mock_server().await;
     let codex_home = TempDir::new()?;
-    mount_analytics_capture(&server, codex_home.path()).await?;
     MockResponsesConfig::new(&server.uri())
         .with_root_config(&format!("chatgpt_base_url = \"{}\"", server.uri()))
         .with_provider_config("supports_websockets = false")
         .enable_feature(Feature::GuardianApproval)
         .disable_feature(Feature::Apps)
         .write(codex_home.path())?;
+    mount_analytics_capture(&server, codex_home.path()).await?;
     let parent_tool = |id: &str| {
         responses::sse_response(responses::sse(vec![
             responses::ev_response_created(id),
@@ -512,6 +514,13 @@ async fn app_server_default_analytics_enabled_with_flag() -> Result<()> {
 }
 
 pub(crate) async fn mount_analytics_capture(server: &MockServer, codex_home: &Path) -> Result<()> {
+    ConfigEditsBuilder::new(codex_home)
+        .with_edits([ConfigEdit::SetPath {
+            segments: vec!["analytics".to_string(), "enabled".to_string()],
+            value: toml_edit::value(true),
+        }])
+        .apply()
+        .await?;
     Mock::given(method("POST"))
         .and(path("/codex/analytics-events/events"))
         .respond_with(ResponseTemplate::new(200))

@@ -43,11 +43,20 @@ impl ChatWidget {
         if !is_resume_initial_replay && !is_retry_error {
             self.restore_retry_status_header_if_present();
         }
+        if !from_replay && let Some(cell) = history_cell::new_model_diagnostic(&notification) {
+            self.add_to_history(cell);
+            self.request_redraw();
+        }
         match notification {
             ServerNotification::ThreadTokenUsageUpdated(notification) => {
-                self.set_token_info(Some(token_usage_info_from_app_server(
-                    notification.token_usage,
-                )));
+                let info = token_usage_info_from_app_server(notification.token_usage);
+                if !from_replay {
+                    self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                        history_cell::new_turn_token_usage(&info.last_token_usage),
+                    )));
+                    self.request_redraw();
+                }
+                self.set_token_info(Some(info));
             }
             ServerNotification::ThreadNameUpdated(notification) => {
                 match ThreadId::from_string(&notification.thread_id) {
@@ -215,7 +224,9 @@ impl ChatWidget {
             ServerNotification::SkillsChanged(_) => {
                 self.refresh_skills_for_current_cwd(/*force_reload*/ true);
             }
-            ServerNotification::ModelRerouted(_) => {}
+            ServerNotification::ModelRerouted(_)
+            | ServerNotification::ClientRoutingHint(_)
+            | ServerNotification::ResponseModel(_) => {}
             ServerNotification::ModelVerification(notification) => {
                 self.on_app_server_model_verification(&notification.verifications)
             }

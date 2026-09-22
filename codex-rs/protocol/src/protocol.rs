@@ -21,6 +21,7 @@ use crate::SessionId;
 use crate::ThreadId;
 use crate::approvals::ElicitationRequestEvent;
 use crate::capabilities::SelectedCapabilityRoot;
+pub use crate::client_routing_hint::ClientRoutingHintEvent;
 use crate::config_types::ApprovalsReviewer;
 use crate::config_types::CollaborationMode;
 use crate::config_types::ModeKind;
@@ -1387,6 +1388,12 @@ pub enum EventMsg {
     /// Model routing changed from the requested model to a different model.
     ModelReroute(ModelRerouteEvent),
 
+    /// Observed client request routing hint and the model selected for the request.
+    ClientRoutingHint(ClientRoutingHintEvent),
+
+    /// Observed completed response model and the model selected for the request.
+    ResponseModel(ResponseModelEvent),
+
     /// Backend recommends additional account verification for this turn.
     ModelVerification(ModelVerificationEvent),
 
@@ -2112,6 +2119,13 @@ pub struct ModelRerouteEvent {
     pub from_model: String,
     pub to_model: String,
     pub reason: ModelRerouteReason,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct ResponseModelEvent {
+    pub response_id: String,
+    pub selected_model: String,
+    pub response_model: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]

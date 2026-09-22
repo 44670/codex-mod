@@ -1977,6 +1977,8 @@ server_notification_definitions! {
     /// Deprecated: Use `ContextCompaction` item type instead.
     ContextCompacted => "thread/compacted" (v2::ContextCompactedNotification),
     ModelRerouted => "model/rerouted" (v2::ModelReroutedNotification),
+    ClientRoutingHint => "model/clientRoutingHint" (v2::ClientRoutingHintNotification),
+    ResponseModel => "model/responseModel" (v2::ResponseModelNotification),
     ModelVerification => "model/verification" (v2::ModelVerificationNotification),
     AuthRecoveryStarted => "modelProvider/authRecoveryStarted" (v2::AuthRecoveryNotification),
     AuthRecoveryCompleted => "modelProvider/authRecoveryCompleted" (v2::AuthRecoveryNotification),

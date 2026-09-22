@@ -842,6 +842,7 @@ mod tests {
         drop(tx_event);
         ResponseStream {
             rx_event,
+            routing_hint: None,
             consumer_dropped: CancellationToken::new(),
         }
     }
@@ -1215,6 +1216,7 @@ mod tests {
             Ok(ResponseEvent::OutputItemDone(compaction.clone())),
             Ok(ResponseEvent::Completed {
                 response_id: "resp-compact".to_string(),
+                model: None,
                 token_usage: Some(TokenUsage {
                     input_tokens: 123_456,
                     cached_input_tokens: 7_890,

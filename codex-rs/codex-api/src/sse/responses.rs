@@ -117,6 +117,7 @@ struct Error {
 #[allow(dead_code)]
 struct ResponseCompleted {
     id: String,
+    model: Option<Value>,
     #[serde(default)]
     usage: Option<ResponseCompletedUsage>,
     usage_metadata: Option<ResponseUsageMetadata>,
@@ -500,6 +501,9 @@ pub fn process_responses_event(
                         }
                         return Ok(Some(ResponseEvent::Completed {
                             response_id: resp.id,
+                            model: resp
+                                .model
+                                .and_then(|model| model.as_str().map(str::to_owned)),
                             token_usage: resp.usage.map(Into::into),
                             usage_metadata: resp.usage_metadata,
                             end_turn: resp.end_turn,
@@ -898,6 +902,7 @@ mod tests {
         match &events[2] {
             Ok(ResponseEvent::Completed {
                 response_id,
+                model: None,
                 token_usage,
                 usage_metadata,
                 end_turn,
@@ -1096,6 +1101,7 @@ mod tests {
         match &events[0] {
             Ok(ResponseEvent::Completed {
                 response_id,
+                model: None,
                 token_usage,
                 usage_metadata,
                 end_turn,
@@ -1607,7 +1613,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_sse_ignores_response_model_field_in_payload() {
+    async fn process_sse_preserves_completed_model_without_emitting_server_model() {
         let events = run_sse(vec![
             json!({
                 "type": "response.created",
@@ -1632,10 +1638,11 @@ mod tests {
             &events[1],
             ResponseEvent::Completed {
                 response_id,
+                model: Some(model),
                 token_usage: None,
                 usage_metadata: None,
                 end_turn: None,
-            } if response_id == "resp-1"
+            } if response_id == "resp-1" && model == CYBER_RESTRICTED_MODEL_FOR_TESTS
         );
     }
 
@@ -1673,6 +1680,7 @@ mod tests {
             &events[2],
             ResponseEvent::Completed {
                 response_id,
+                model: None,
                 token_usage: None,
                 usage_metadata: None,
                 end_turn: None,
@@ -1709,6 +1717,7 @@ mod tests {
             &events[1],
             ResponseEvent::Completed {
                 response_id,
+                model: None,
                 token_usage: None,
                 usage_metadata: None,
                 end_turn: None,
@@ -1745,6 +1754,7 @@ mod tests {
             &events[1],
             ResponseEvent::Completed {
                 response_id,
+                model: None,
                 token_usage: None,
                 usage_metadata: None,
                 end_turn: None,

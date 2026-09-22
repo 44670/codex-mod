@@ -1617,6 +1617,12 @@ fn should_process_notification(
         ServerNotification::ModelRerouted(notification) => {
             notification.thread_id == thread_id && notification.turn_id == turn_id
         }
+        ServerNotification::ClientRoutingHint(notification) => {
+            notification.thread_id == thread_id && notification.turn_id == turn_id
+        }
+        ServerNotification::ResponseModel(notification) => {
+            notification.thread_id == thread_id && notification.turn_id == turn_id
+        }
         ServerNotification::ModelVerification(notification) => {
             notification.thread_id == thread_id && notification.turn_id == turn_id
         }

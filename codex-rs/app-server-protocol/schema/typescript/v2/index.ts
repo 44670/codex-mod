@@ -64,6 +64,7 @@ export type { ChatgptAuthTokensRefreshParams } from "./ChatgptAuthTokensRefreshP
 export type { ChatgptAuthTokensRefreshReason } from "./ChatgptAuthTokensRefreshReason";
 export type { ChatgptAuthTokensRefreshResponse } from "./ChatgptAuthTokensRefreshResponse";
 export type { CliAuthCredentialsStoreMode } from "./CliAuthCredentialsStoreMode";
+export type { ClientRoutingHintNotification } from "./ClientRoutingHintNotification";
 export type { CodexErrorInfo } from "./CodexErrorInfo";
 export type { CollabAgentState } from "./CollabAgentState";
 export type { CollabAgentStatus } from "./CollabAgentStatus";
@@ -422,6 +423,7 @@ export type { RemoteControlEnableParams } from "./RemoteControlEnableParams";
 export type { RemoteControlStatusChangedNotification } from "./RemoteControlStatusChangedNotification";
 export type { RequestPermissionProfile } from "./RequestPermissionProfile";
 export type { ResidencyRequirement } from "./ResidencyRequirement";
+export type { ResponseModelNotification } from "./ResponseModelNotification";
 export type { ResponseUsageMetadata } from "./ResponseUsageMetadata";
 export type { ReviewDelivery } from "./ReviewDelivery";
 export type { ReviewStartParams } from "./ReviewStartParams";

@@ -2042,6 +2042,8 @@ pub(super) fn realtime_text_for_event(msg: &EventMsg) -> Option<(String, Option<
         | EventMsg::RealtimeConversationRealtime(_)
         | EventMsg::RealtimeConversationClosed(_)
         | EventMsg::ModelReroute(_)
+        | EventMsg::ClientRoutingHint(_)
+        | EventMsg::ResponseModel(_)
         | EventMsg::ModelVerification(_)
         | EventMsg::TurnModerationMetadata(_)
         | EventMsg::SafetyBuffering(_)
@@ -2499,6 +2501,15 @@ async fn try_run_sampling_request(
         .instrument(trace_span!("stream_request"))
         .or_cancel(&cancellation_token)
         .await??;
+    if let Some(value) = stream.routing_hint.take()
+        && let Some(hint) = codex_protocol::protocol::ClientRoutingHintEvent::from_header(
+            value,
+            &step_context.settings.model_info.slug,
+        )
+    {
+        sess.send_event(&turn_context, EventMsg::ClientRoutingHint(hint))
+            .await;
+    }
     let mut in_flight: FuturesOrdered<InFlightFuture<'static>> = FuturesOrdered::new();
     let mut needs_follow_up = false;
     let mut last_agent_message: Option<String> = None;
@@ -2826,6 +2837,7 @@ async fn try_run_sampling_request(
             }
             ResponseEvent::Completed {
                 response_id,
+                model,
                 token_usage,
                 usage_metadata,
                 end_turn,
@@ -2847,6 +2859,20 @@ async fn try_run_sampling_request(
                     &mut assistant_message_stream_parsers,
                 )
                 .await;
+                if let Some(model) = model
+                    && !model.trim().is_empty()
+                    && !step_context.settings.model_info.slug.is_empty()
+                {
+                    sess.send_event(
+                        &turn_context,
+                        EventMsg::ResponseModel(codex_protocol::protocol::ResponseModelEvent {
+                            response_id: response_id.clone(),
+                            selected_model: step_context.settings.model_info.slug.clone(),
+                            response_model: model,
+                        }),
+                    )
+                    .await;
+                }
                 sess.record_observed_response_completed(
                     &turn_context,
                     &response_id,

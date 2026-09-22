@@ -1,3 +1,32 @@
+# Model routing diagnostics (custom build)
+
+Client routing mismatches use the `model/clientRoutingHint` notification with
+`threadId`, `turnId`, `headerValue`, `selectedModel`, and `routingModel` fields.
+They are emitted only when a sampling request opens a response stream whose
+`x-codex-routing-hint` header has exactly one nonempty `model` value different
+from the model selected for that request. The `tier` field is ignored. Matching,
+missing, empty, and duplicate model fields do not generate an event. For WebSockets,
+the value is taken from the active connection's handshake, including when that
+connection is reused. Prewarming alone does not emit this notification. Failed
+attempts that do not open a response stream are not recorded by this diagnostic.
+This is a client request hint, not confirmation of the model used by the server.
+
+The same mismatch-only policy applies to `response.completed.response.model`.
+The `model/responseModel` notification carries `threadId`, `turnId`, `responseId`,
+`selectedModel`, and `responseModel`. Matching, absent, empty, whitespace-only,
+or non-string model fields do not emit this diagnostic. The value is an observation
+of the response payload, not proof of the actual execution model; it does not feed
+the header-based `ModelReroute` handling or change subsequent model requests.
+
+The custom build persists `client_routing_hint`, `response_model`, `model_reroute`, and
+`safety_buffering` as `event_msg` entries in session JSONL, not model input.
+Warnings retain upstream's persistence behavior. Existing warning records remain
+readable, but new routing diagnostics no longer use that channel.
+The TUI displays these live diagnostics in red, using the selection captured in
+the event rather than comparing again after a later model selection change.
+The existing safety buffering controls are unchanged. These diagnostic lines
+are not replayed on resume.
+
 # Model catalog provider requirements
 
 `model/list` and periodic model catalog refreshes check the startup provider against

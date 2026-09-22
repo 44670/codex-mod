@@ -167,6 +167,7 @@ async fn responses_stream_parses_items_and_completed_end_to_end() -> Result<()> 
     match &events[2] {
         ResponseEvent::Completed {
             response_id,
+            model: None,
             token_usage,
             usage_metadata,
             end_turn,

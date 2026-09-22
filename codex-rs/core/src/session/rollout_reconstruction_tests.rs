@@ -340,6 +340,73 @@ async fn record_initial_history_ignores_security_risk_scores() {
     );
 }
 
+#[tokio::test]
+async fn persisted_model_diagnostics_do_not_enter_resumed_model_input() {
+    use codex_protocol::protocol::ClientRoutingHintEvent;
+    use codex_protocol::protocol::ModelRerouteEvent;
+    use codex_protocol::protocol::ModelRerouteReason;
+    use codex_protocol::protocol::SafetyBufferingEvent;
+    use codex_protocol::protocol::ThreadHistoryMode;
+    use codex_protocol::protocol::WarningEvent;
+
+    let user_item = user_message("visible user input");
+    let items = vec![
+        RolloutItem::ResponseItem(ResponseItemEnvelope::new(user_item.clone())),
+        RolloutItem::EventMsg(EventMsg::ClientRoutingHint(
+            ClientRoutingHintEvent::from_header(
+                "model=routing-model;tier=priority".to_string(),
+                "requested-model",
+            )
+            .expect("mismatched hint"),
+        )),
+        RolloutItem::EventMsg(EventMsg::ModelReroute(ModelRerouteEvent {
+            from_model: "requested-model".into(),
+            to_model: "fallback-model".into(),
+            reason: ModelRerouteReason::HighRiskCyberActivity,
+        })),
+        RolloutItem::EventMsg(EventMsg::SafetyBuffering(SafetyBufferingEvent {
+            model: "requested-model".into(),
+            use_cases: vec!["cyber".into()],
+            reasons: vec!["review".into()],
+            show_buffering_ui: false,
+            faster_model: None,
+        })),
+    ];
+    let mut with_unrelated_warning = items.clone();
+    with_unrelated_warning.push(RolloutItem::EventMsg(EventMsg::Warning(WarningEvent {
+        message: "unrelated warning".into(),
+    })));
+    for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
+        let persisted =
+            codex_rollout::persisted_rollout_items(&with_unrelated_warning, history_mode);
+        assert_eq!(
+            serde_json::to_value(&persisted).unwrap(),
+            serde_json::to_value(&items).unwrap()
+        );
+        let encoded = serde_json::to_string(&persisted).expect("serialize diagnostics");
+        let decoded: Vec<RolloutItem> = serde_json::from_str(&encoded).expect("read diagnostics");
+        assert_eq!(
+            serde_json::to_value(&decoded).unwrap(),
+            serde_json::to_value(&items).unwrap()
+        );
+
+        let (session, _turn_context) = make_session_and_context().await;
+        session
+            .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+                conversation_id: ThreadId::default(),
+                history: Arc::new(decoded),
+                rollout_path: None,
+            }))
+            .await;
+        assert_eq!(
+            strip_metadata_from_items(&raw_history_items(
+                &session.state.lock().await.clone_history()
+            )),
+            vec![user_item.clone()]
+        );
+    }
+}
+
 #[derive(Clone, Copy)]
 enum BaselineTurnInput {
     UserMessage,

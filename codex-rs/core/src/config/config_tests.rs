@@ -6401,21 +6401,33 @@ fn local_dev_builds_force_file_mcp_oauth_store_modes() {
 }
 
 #[tokio::test]
-async fn feedback_enabled_defaults_to_true() -> std::io::Result<()> {
+async fn reporting_requires_explicit_config_opt_in() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
-    let cfg = ConfigToml {
-        feedback: Some(FeedbackConfigToml::default()),
-        ..Default::default()
-    };
+    for (source, enabled) in [
+        ("", false),
+        ("[analytics]\n[feedback]\n", false),
+        (
+            "[analytics]\nenabled = false\n[feedback]\nenabled = false\n",
+            false,
+        ),
+        (
+            "[analytics]\nenabled = true\n[feedback]\nenabled = true\n",
+            true,
+        ),
+    ] {
+        let cfg: ConfigToml = toml::from_str(source).expect("reporting config");
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.abs(),
+        )
+        .await?;
 
-    let config = Config::load_from_base_config_with_overrides(
-        cfg,
-        ConfigOverrides::default(),
-        codex_home.abs(),
-    )
-    .await?;
-
-    assert_eq!(config.feedback_enabled, true);
+        assert_eq!(
+            (config.analytics_enabled, config.feedback_enabled),
+            (Some(enabled), enabled),
+        );
+    }
 
     Ok(())
 }
@@ -9875,7 +9887,7 @@ async fn legacy_profile_selection_is_rejected() -> std::io::Result<()> {
 }
 
 #[tokio::test]
-async fn metrics_exporter_defaults_to_statsig_when_missing() -> std::io::Result<()> {
+async fn otel_exporters_default_to_none() -> std::io::Result<()> {
     let fixture = create_test_fixture()?;
 
     let config = Config::load_from_base_config_with_overrides(
@@ -9888,7 +9900,21 @@ async fn metrics_exporter_defaults_to_statsig_when_missing() -> std::io::Result<
     )
     .await?;
 
-    assert_eq!(config.otel.metrics_exporter, OtelExporterKind::Statsig);
+    assert_eq!(config.otel, codex_config::types::OtelConfig::default());
+    assert_eq!(
+        (
+            config.otel.exporter,
+            config.otel.trace_exporter,
+            config.otel.metrics_exporter,
+            config.otel.log_user_prompt,
+        ),
+        (
+            OtelExporterKind::None,
+            OtelExporterKind::None,
+            OtelExporterKind::None,
+            false,
+        ),
+    );
     Ok(())
 }
 

@@ -9,6 +9,7 @@ use crate::legacy_core::config::ConfigBuilder;
 use crate::line_truncation::line_width;
 use crate::render::highlight::MAX_HIGHLIGHT_LINE_BYTES;
 use crate::session_state::ThreadSessionState;
+use crate::token_usage::TokenUsage;
 use crate::wrapping::word_wrap_lines;
 use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::McpAuthStatus;
@@ -135,6 +136,48 @@ fn streaming_agent_tail_blank_line_uses_one_viewport_row() {
 
   second");
     assert_eq!(cell.desired_height(/*width*/ 80), 3);
+}
+
+fn token_usage(output_tokens: i64, reasoning_output_tokens: i64) -> TokenUsage {
+    TokenUsage {
+        output_tokens,
+        reasoning_output_tokens,
+        ..TokenUsage::default()
+    }
+}
+
+#[test]
+fn turn_token_usage_cell_renders_counts() {
+    let cell = new_turn_token_usage(&token_usage(1_234, 1_500));
+    let lines = cell.display_lines(/*width*/ 80);
+
+    insta::assert_snapshot!(
+        render_lines(&lines).join("\n"),
+        @"• tokens: output 1,234 · reasoning 1,500"
+    );
+}
+
+#[test]
+fn turn_token_usage_cell_colors_reasoning_thresholds() {
+    fn reasoning_color(reasoning_tokens: i64) -> Option<Color> {
+        let cell = new_turn_token_usage(&token_usage(/*output_tokens*/ 0, reasoning_tokens));
+        cell.display_lines(/*width*/ 80)[0]
+            .spans
+            .last()
+            .expect("reasoning token span")
+            .style
+            .fg
+    }
+
+    assert_eq!(reasoning_color(0), None);
+    assert_eq!(reasoning_color(516), Some(Color::Red));
+    assert_eq!(reasoning_color(1_034), Some(Color::Red));
+    assert_eq!(reasoning_color(1_552), Some(Color::Red));
+    assert_eq!(reasoning_color(1_032), Some(Color::Green));
+    assert_eq!(reasoning_color(2_580), Some(Color::Green));
+    assert_eq!(reasoning_color(3_096), Some(Color::Green));
+    assert_eq!(reasoning_color(1_001), Some(Color::Green));
+    assert_eq!(reasoning_color(1_000), None);
 }
 
 fn stdio_server_config(

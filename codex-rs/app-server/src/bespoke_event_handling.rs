@@ -11,6 +11,7 @@ use crate::thread_status::ThreadWatchManager;
 use codex_app_server_protocol::AccountRateLimitsUpdatedNotification;
 use codex_app_server_protocol::AdditionalPermissionProfile as V2AdditionalPermissionProfile;
 use codex_app_server_protocol::AuthRecoveryNotification;
+use codex_app_server_protocol::ClientRoutingHintNotification;
 use codex_app_server_protocol::CodexErrorInfo as V2CodexErrorInfo;
 use codex_app_server_protocol::CommandAction as V2ParsedCommand;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
@@ -395,6 +396,32 @@ pub(crate) async fn apply_bespoke_event_handling(
                 )
                 .await;
             }
+        }
+        EventMsg::ResponseModel(event) => {
+            outgoing
+                .send_server_notification(ServerNotification::ResponseModel(
+                    codex_app_server_protocol::ResponseModelNotification {
+                        thread_id: conversation_id.to_string(),
+                        turn_id: event_turn_id.clone(),
+                        response_id: event.response_id,
+                        selected_model: event.selected_model,
+                        response_model: event.response_model,
+                    },
+                ))
+                .await;
+        }
+        EventMsg::ClientRoutingHint(event) => {
+            outgoing
+                .send_server_notification(ServerNotification::ClientRoutingHint(
+                    ClientRoutingHintNotification {
+                        thread_id: conversation_id.to_string(),
+                        turn_id: event_turn_id.clone(),
+                        header_value: event.header_value,
+                        selected_model: event.selected_model,
+                        routing_model: event.routing_model,
+                    },
+                ))
+                .await;
         }
         EventMsg::ModelReroute(event) => {
             let notification = ModelReroutedNotification {

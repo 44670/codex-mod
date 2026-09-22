@@ -5676,6 +5676,46 @@
           "properties": {
             "method": {
               "enum": [
+                "model/clientRoutingHint"
+              ],
+              "title": "Model/clientRoutingHintNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ClientRoutingHintNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Model/clientRoutingHintNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "model/responseModel"
+              ],
+              "title": "Model/responseModelNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ResponseModelNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Model/responseModelNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
                 "model/verification"
               ],
               "title": "Model/verificationNotificationMethod",
@@ -8310,6 +8350,35 @@
           "ephemeral"
         ],
         "type": "string"
+      },
+      "ClientRoutingHintNotification": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "headerValue": {
+            "type": "string"
+          },
+          "routingModel": {
+            "type": "string"
+          },
+          "selectedModel": {
+            "type": "string"
+          },
+          "threadId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "headerValue",
+          "routingModel",
+          "selectedModel",
+          "threadId",
+          "turnId"
+        ],
+        "title": "ClientRoutingHintNotification",
+        "type": "object"
       },
       "CodexErrorInfo": {
         "description": "This translation layer make sure that we expose codex error code in camel case.\n\nWhen an upstream HTTP status is available (for example, from the Responses API or a provider), it is forwarded in `httpStatusCode` on the relevant `codexErrorInfo` variant.",
@@ -19138,6 +19207,35 @@
             "type": "object"
           }
         ]
+      },
+      "ResponseModelNotification": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "responseId": {
+            "type": "string"
+          },
+          "responseModel": {
+            "type": "string"
+          },
+          "selectedModel": {
+            "type": "string"
+          },
+          "threadId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "responseId",
+          "responseModel",
+          "selectedModel",
+          "threadId",
+          "turnId"
+        ],
+        "title": "ResponseModelNotification",
+        "type": "object"
       },
       "ResponseUsageMetadata": {
         "description": "Usage metadata reported for one upstream response.",

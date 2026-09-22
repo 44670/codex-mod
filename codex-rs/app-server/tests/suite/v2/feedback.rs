@@ -16,6 +16,7 @@ async fn feedback_upload_limits_concurrency_and_releases_failed_uploads() -> Res
     let proxy = TcpListener::bind("127.0.0.1:0").await?;
     let proxy_uri = format!("http://{}", proxy.local_addr()?);
     let mut app_server = TestAppServer::builder()
+        .with_args(&["-c", "feedback.enabled=true"])
         .with_env_overrides(&[
             ("HTTPS_PROXY", Some(proxy_uri.as_str())),
             ("https_proxy", Some(proxy_uri.as_str())),

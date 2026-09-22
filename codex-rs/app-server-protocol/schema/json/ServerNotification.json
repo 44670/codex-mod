@@ -653,6 +653,33 @@
       ],
       "type": "object"
     },
+    "ClientRoutingHintNotification": {
+      "properties": {
+        "headerValue": {
+          "type": "string"
+        },
+        "routingModel": {
+          "type": "string"
+        },
+        "selectedModel": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "headerValue",
+        "routingModel",
+        "selectedModel",
+        "threadId",
+        "turnId"
+      ],
+      "type": "object"
+    },
     "CodexErrorInfo": {
       "description": "This translation layer make sure that we expose codex error code in camel case.\n\nWhen an upstream HTTP status is available (for example, from the Responses API or a provider), it is forwarded in `httpStatusCode` on the relevant `codexErrorInfo` variant.",
       "oneOf": [
@@ -3727,6 +3754,33 @@
           ]
         }
       },
+      "type": "object"
+    },
+    "ResponseModelNotification": {
+      "properties": {
+        "responseId": {
+          "type": "string"
+        },
+        "responseModel": {
+          "type": "string"
+        },
+        "selectedModel": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "responseId",
+        "responseModel",
+        "selectedModel",
+        "threadId",
+        "turnId"
+      ],
       "type": "object"
     },
     "SandboxPolicy": {
@@ -8010,6 +8064,46 @@
         "params"
       ],
       "title": "Model/reroutedNotification",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "model/clientRoutingHint"
+          ],
+          "title": "Model/clientRoutingHintNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ClientRoutingHintNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "Model/clientRoutingHintNotification",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "model/responseModel"
+          ],
+          "title": "Model/responseModelNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ResponseModelNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "Model/responseModelNotification",
       "type": "object"
     },
     {

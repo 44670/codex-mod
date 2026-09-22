@@ -1,6 +1,7 @@
 pub mod account;
 mod agent_path;
 pub mod auth;
+mod client_routing_hint;
 mod response_item_id;
 mod response_usage;
 mod sanitized_git_url;

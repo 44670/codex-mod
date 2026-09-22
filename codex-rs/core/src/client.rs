@@ -313,6 +313,8 @@ struct WebsocketContinuation {
 #[derive(Debug, Default)]
 struct WebsocketSession {
     connection: Option<ApiWebSocketConnection>,
+    /// Keep the handshake value when reusing a connection, including prewarmed ones.
+    routing_hint: Option<String>,
     responses_headers: ApiHeaderMap,
     /// Owner of the cached state, including before a connection is opened.
     auth_owner_generation: Option<u64>,
@@ -1214,9 +1216,14 @@ impl ModelClient {
         auth_context: AuthRequestTelemetryContext,
         request_route_telemetry: RequestRouteTelemetry,
         responses_headers: &ApiHeaderMap,
-    ) -> std::result::Result<ApiWebSocketConnection, ApiError> {
+    ) -> std::result::Result<(ApiWebSocketConnection, Option<String>), ApiError> {
         let mut headers = self.build_websocket_headers(responses_metadata).await;
         headers.extend(responses_headers.clone());
+        let routing_hint = headers
+            .get(X_CODEX_ROUTING_HINT_HEADER)
+            .or_else(|| api_provider.headers.get(X_CODEX_ROUTING_HINT_HEADER))
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let websocket_telemetry = ModelClientSession::build_websocket_telemetry(
             session_telemetry,
             auth_context.clone(),
@@ -1288,7 +1295,7 @@ impl ModelClient {
             },
             &self.state.auth_env_telemetry,
         );
-        result
+        result.map(|connection| (connection, routing_hint))
     }
 
     /// Builds websocket handshake headers for both prewarm and turn-time reconnect.
@@ -1547,7 +1554,7 @@ impl ModelClientSession {
             } else {
                 reset_reason
             });
-            let new_conn = self
+            let (new_conn, routing_hint) = self
                 .client
                 .connect_websocket(
                     session_telemetry,
@@ -1560,6 +1567,7 @@ impl ModelClientSession {
                 )
                 .await?;
             self.websocket_session.connection = Some(new_conn);
+            self.websocket_session.routing_hint = routing_hint;
             self.websocket_session.responses_headers = responses_headers.clone();
             self.websocket_session.auth_owner_generation = auth_owner_generation;
             self.websocket_session.connection_key = Some(connection_key);
@@ -1706,6 +1714,17 @@ impl ModelClientSession {
             let inference_trace_attempt = inference_trace.start_attempt();
             inference_trace_attempt.add_request_headers(&mut options.extra_headers);
             inference_trace_attempt.record_started(&request);
+            let routing_hint = options
+                .extra_headers
+                .get(X_CODEX_ROUTING_HINT_HEADER)
+                .or_else(|| {
+                    client_setup
+                        .api_provider
+                        .headers
+                        .get(X_CODEX_ROUTING_HINT_HEADER)
+                })
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
             let client = ApiResponsesClient::new(
                 transport,
                 client_setup.api_provider,
@@ -1716,12 +1735,13 @@ impl ModelClientSession {
 
             match stream_result {
                 Ok(stream) => {
-                    let (stream, _) = map_response_stream(
+                    let (mut stream, _) = map_response_stream(
                         stream,
                         request_session_telemetry,
                         inference_trace_attempt,
                         Arc::clone(&self.client.state.provider),
                     );
+                    stream.routing_hint = routing_hint;
                     return Ok(stream);
                 }
                 Err(ApiError::Transport(unauthorized_transport))
@@ -2021,12 +2041,13 @@ impl ModelClientSession {
                 );
                 err
             })?;
-            let (stream, last_request_rx) = map_response_stream(
+            let (mut stream, last_request_rx) = map_response_stream(
                 stream_result,
                 request_session_telemetry,
                 inference_trace_attempt,
                 Arc::clone(&self.client.state.provider),
             );
+            stream.routing_hint = self.websocket_session.routing_hint.clone();
             self.websocket_session.last_response_rx = Some(last_request_rx);
             return Ok(WebsocketStreamOutcome::Stream(stream));
         }
@@ -2339,6 +2360,7 @@ where
                 }
                 Ok(ResponseEvent::Completed {
                     response_id,
+                    model,
                     token_usage,
                     usage_metadata,
                     end_turn,
@@ -2362,6 +2384,7 @@ where
                     if tx_event
                         .send(Ok(ResponseEvent::Completed {
                             response_id,
+                            model,
                             token_usage,
                             usage_metadata,
                             end_turn,
@@ -2421,6 +2444,7 @@ where
     (
         ResponseStream {
             rx_event,
+            routing_hint: None,
             consumer_dropped: consumer_dropped_for_stream,
         },
         rx_last_response,

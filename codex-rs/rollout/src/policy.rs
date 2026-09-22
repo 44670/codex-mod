@@ -110,7 +110,12 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
                         if item.kind == SubAgentActivityKind::Completed
                 )
         }
+        // Matching model observations are live UI only; retain mismatches in JSONL.
+        EventMsg::ClientRoutingHint(event) => event.routing_model != event.selected_model,
+        EventMsg::ResponseModel(event) => event.response_model != event.selected_model,
         EventMsg::TokenCount(_)
+        | EventMsg::ModelReroute(_)
+        | EventMsg::SafetyBuffering(_)
         | EventMsg::ThreadGoalUpdated(_)
         | EventMsg::ThreadRolledBack(_)
         | EventMsg::TurnAborted(_)
@@ -140,6 +145,7 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
 
         // Transient, non-durable events.
         EventMsg::Error(_)
+        | EventMsg::Warning(_)
         | EventMsg::ThreadQueueChanged(_)
         | EventMsg::GuardianAssessment(_)
         | EventMsg::ExecCommandEnd(_)
@@ -151,7 +157,6 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::CollabResumeEnd(_)
         | EventMsg::DynamicToolCallRequest(_)
         | EventMsg::DynamicToolCallResponse(_)
-        | EventMsg::Warning(_)
         | EventMsg::AuthRecoveryStarted(_)
         | EventMsg::AuthRecoveryCompleted(_)
         | EventMsg::GuardianWarning(_)
@@ -159,8 +164,6 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::RealtimeConversationSdp(_)
         | EventMsg::RealtimeConversationRealtime(_)
         | EventMsg::RealtimeConversationClosed(_)
-        | EventMsg::SafetyBuffering(_)
-        | EventMsg::ModelReroute(_)
         | EventMsg::ModelVerification(_)
         | EventMsg::TurnModerationMetadata(_)
         | EventMsg::AgentReasoningSectionBreak(_)

@@ -538,6 +538,17 @@ class ClientInfo(BaseModel):
     version: str
 
 
+class ClientRoutingHintNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    header_value: Annotated[str, Field(alias="headerValue")]
+    routing_model: Annotated[str, Field(alias="routingModel")]
+    selected_model: Annotated[str, Field(alias="selectedModel")]
+    thread_id: Annotated[str, Field(alias="threadId")]
+    turn_id: Annotated[str, Field(alias="turnId")]
+
+
 class CodexErrorInfoValue(Enum):
     context_window_exceeded = "contextWindowExceeded"
     session_budget_exceeded = "sessionBudgetExceeded"
@@ -4024,6 +4035,17 @@ class OtherResponseItem(BaseModel):
     type: Annotated[Literal["other"], Field(title="OtherResponseItemType")]
 
 
+class ResponseModelNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    response_id: Annotated[str, Field(alias="responseId")]
+    response_model: Annotated[str, Field(alias="responseModel")]
+    selected_model: Annotated[str, Field(alias="selectedModel")]
+    thread_id: Annotated[str, Field(alias="threadId")]
+    turn_id: Annotated[str, Field(alias="turnId")]
+
+
 class ResponseUsageMetadata(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -4610,6 +4632,40 @@ class ModelReroutedServerNotification(BaseModel):
     ] = None
     method: Annotated[Literal["model/rerouted"], Field(title="Model/reroutedNotificationMethod")]
     params: ModelReroutedNotification
+
+
+class ModelClientRoutingHintServerNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    emitted_at_ms: Annotated[
+        int | None,
+        Field(
+            alias="emittedAtMs",
+            description="Unix timestamp (in milliseconds) when app-server emitted this notification.",
+        ),
+    ] = None
+    method: Annotated[
+        Literal["model/clientRoutingHint"], Field(title="Model/clientRoutingHintNotificationMethod")
+    ]
+    params: ClientRoutingHintNotification
+
+
+class ModelResponseModelServerNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    emitted_at_ms: Annotated[
+        int | None,
+        Field(
+            alias="emittedAtMs",
+            description="Unix timestamp (in milliseconds) when app-server emitted this notification.",
+        ),
+    ] = None
+    method: Annotated[
+        Literal["model/responseModel"], Field(title="Model/responseModelNotificationMethod")
+    ]
+    params: ResponseModelNotification
 
 
 class ModelVerificationServerNotification(BaseModel):
@@ -12705,6 +12761,8 @@ class ServerNotification(
         | ItemReasoningTextDeltaServerNotification
         | ThreadCompactedServerNotification
         | ModelReroutedServerNotification
+        | ModelClientRoutingHintServerNotification
+        | ModelResponseModelServerNotification
         | ModelVerificationServerNotification
         | ModelProviderAuthRecoveryStartedServerNotification
         | ModelProviderAuthRecoveryCompletedServerNotification
@@ -12793,6 +12851,8 @@ class ServerNotification(
         | ItemReasoningTextDeltaServerNotification
         | ThreadCompactedServerNotification
         | ModelReroutedServerNotification
+        | ModelClientRoutingHintServerNotification
+        | ModelResponseModelServerNotification
         | ModelVerificationServerNotification
         | ModelProviderAuthRecoveryStartedServerNotification
         | ModelProviderAuthRecoveryCompletedServerNotification
